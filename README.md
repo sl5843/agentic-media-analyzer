@@ -1,5 +1,18 @@
 # Agentic Media Analyzer
 
+## Publish this folder to GitHub (first time)
+
+GitHub cannot be created from this machine until you log in there. Do this once:
+
+1. **Open in your browser:** double-click `open-github-new-repo.html` in this folder (or open [this “new repository” link](https://github.com/new?name=agentic-media-analyzer&description=Agentic%20Media%20Analyzer%20%28Gemini%20%2B%20Vercel%29)).
+2. Set **Repository name** to `agentic-media-analyzer` (or change the name and edit `push-to-github.ps1`).
+3. Choose **Public**. Do **not** add README, .gitignore, or license (keep the repo empty).
+4. Click **Create repository**.
+5. In PowerShell, from this folder, run: `.\push-to-github.ps1`  
+   (If GitHub asks for login, use a [Personal Access Token](https://github.com/settings/tokens) as the password when `git push` prompts you.)
+
+---
+
 Single-page UI plus **Vercel serverless** proxies. The browser never sees your Gemini (or Serper) keys — they live only in **environment variables** on Vercel (or in a local `.env.local` for `vercel dev`).
 
 ## Why not put the key in `index.html`?
