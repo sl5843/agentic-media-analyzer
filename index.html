@@ -383,9 +383,10 @@ function extractBalancedJson(s) {
   return null;
 }
 
-function parseGeminiRetryDelayMs(apiMessage) {
+/** Parses "retry in 28s" (Gemini) or "try again in 31.7s" (Groq). */
+function parseRetryDelayMsFromMessage(apiMessage) {
   const s = apiMessage == null ? '' : String(apiMessage);
-  const m = s.match(/retry in ([\d.]+)\s*s/i);
+  const m = s.match(/(?:retry|try again) in ([\d.]+)\s*s/i);
   if (m) {
     const sec = parseFloat(m[1], 10);
     if (!Number.isNaN(sec)) {
@@ -451,10 +452,13 @@ async function analyzeWithGroqChat(content, task, options = {}) {
           state.lastQuotaError = fullMsg;
         }
         if (retryable && attempt < maxAttempts - 1) {
-          const waitMs = res.status === 429 ? 10000 + attempt * 8000 : 1500 * (attempt + 1);
+          const waitMs =
+            res.status === 429
+              ? parseRetryDelayMsFromMessage(fullMsg)
+              : 1500 * (attempt + 1);
           logReasoning(`Groq ${res.status}, waiting ~${Math.round(waitMs / 1000)}s before retry ${attempt + 2}/${maxAttempts}`);
           await new Promise((r) => setTimeout(r, waitMs));
-          state.geminiNextSlot = Date.now() + 500;
+          state.geminiNextSlot = Date.now() + 900;
           lastErr = new Error(`Groq HTTP ${res.status}: ${msg}`);
           continue;
         }
@@ -470,7 +474,7 @@ async function analyzeWithGroqChat(content, task, options = {}) {
         }
         throw err;
       }
-      state.geminiNextSlot = Date.now() + 400;
+      state.geminiNextSlot = Date.now() + 750;
       return String(text);
     } catch (e) {
       if (e.message && /Failed to fetch|network/i.test(e.message) && attempt < maxAttempts - 1) {
@@ -542,7 +546,7 @@ async function analyzeWithGemini(content, task, options = {}) {
         }
         if (retryable && attempt < maxAttempts - 1) {
           const waitMs =
-            res.status === 429 ? parseGeminiRetryDelayMs(fullMsg) : 1500 * (attempt + 1);
+            res.status === 429 ? parseRetryDelayMsFromMessage(fullMsg) : 1500 * (attempt + 1);
           logReasoning(`Gemini ${res.status}, waiting ~${Math.round(waitMs / 1000)}s before retry ${attempt + 2}/${maxAttempts}`);
           await new Promise((r) => setTimeout(r, waitMs));
           state.geminiNextSlot = Date.now() + 600;
@@ -1408,7 +1412,7 @@ function renderFinalReport(reportJson, ctx) {
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
 
-  if (ctx.quotaError) {
+  if (ctx.quotaError && !reportJson) {
     const vendor = state.llmBackend === 'groq' ? 'Groq' : 'Google Gemini';
     appendReportSection(
       'API quota / rate limit',
@@ -1417,7 +1421,7 @@ function renderFinalReport(reportJson, ctx) {
         ' returned HTTP 429 — quota or rate limit exceeded.</strong> This app makes many model calls per run (plan, topic, compare×3, sentiment, reflect, report). Free tiers have per-minute and daily caps; long pages use more input tokens per call.</p>' +
         '<ul>' +
         '<li>Wait a few minutes (or until the next daily window) and try again.</li>' +
-        '<li>If using Gemini: enable billing or check <a href="https://ai.google.dev/gemini-api/docs/rate-limits" target="_blank" rel="noopener">Gemini rate limits</a>. If using Groq: see <a href="https://console.groq.com/docs/rate-limits" target="_blank" rel="noopener">Groq rate limits</a>.</li>' +
+        '<li>If using Gemini: enable billing or check <a href="https://ai.google.dev/gemini-api/docs/rate-limits" target="_blank" rel="noopener">Gemini rate limits</a>. If using Groq: see <a href="https://console.groq.com/docs/rate-limits" target="_blank" rel="noopener">Groq rate limits</a> or set <code>GROQ_MODEL</code> to a smaller/faster model.</li>' +
         '<li>Or add <strong>GROQ_API_KEY</strong> on Vercel to switch off a maxed-out Gemini free tier (Groq is used first when both keys are set).</li>' +
         '<li>Paste a <strong>short excerpt</strong> as text instead of a huge page to cut input tokens.</li>' +
         '</ul>' +
@@ -1425,11 +1429,19 @@ function renderFinalReport(reportJson, ctx) {
         esc((ctx.quotaError || '').slice(0, 400)) +
         '</p>'
     );
+  } else if (ctx.quotaError && reportJson) {
+    appendReportSection(
+      'Rate limit (recovered)',
+      '<p>At least one request hit a <strong>per-minute token (TPM) or request cap</strong> mid-run; the client waited and retried, and the report below still completed. For fewer interruptions, space out runs, paste shorter text, set <code>GROQ_MODEL=llama-3.1-8b-instant</code> on Vercel, or upgrade Groq billing tier.</p>' +
+        '<details class="raw-log"><summary>Technical detail</summary><pre>' +
+        esc((ctx.quotaError || '').slice(0, 500)) +
+        '</pre></details>'
+    );
   }
 
   if (!reportJson) {
     const why = ctx.quotaError
-      ? 'Gemini could not complete the final JSON report, likely due to quota limits above.'
+      ? 'The LLM could not complete the final JSON report, likely due to quota limits above.'
       : 'The model could not return structured JSON; showing key facts from the run.';
     const topicShow = ctx.topicBundle?.topic || ctx.searchTopic || '—';
     appendReportSection(
