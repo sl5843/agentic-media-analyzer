@@ -4,11 +4,6 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Agentic Media Analyzer — Gemini 2.0 Flash</title>
-  <script>
-/* API keys — Gemini required; Serper optional (richer web search, https://serper.dev) */
-const GEMINI_API_KEY = 'your-key-here';
-const SERPER_API_KEY = '';
-  </script>
   <style>
     :root {
       --bg: #0a0e14;
@@ -321,7 +316,10 @@ const SERPER_API_KEY = '';
 
   <script>
 const GEMINI_MODEL = 'gemini-2.0-flash';
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+/** Same-origin API (Vercel serverless). Keys live in Vercel env, not in the browser. */
+const API_GEMINI = '/api/gemini';
+const API_HEALTH = '/api/health';
+const API_SERPER = '/api/serper';
 
 const ALLORIGINS = 'https://api.allorigins.win/get?url=';
 
@@ -361,18 +359,20 @@ async function analyzeWithGemini(content, task, options = {}) {
     },
   };
 
-  const res = await fetch(`${GEMINI_URL}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+  const res = await fetch(`${API_GEMINI}?model=${encodeURIComponent(GEMINI_MODEL)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
 
+  const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const errText = await res.text();
-    throw new Error(`Gemini HTTP ${res.status}: ${errText.slice(0, 200)}`);
+    const msg =
+      data?.error?.message ||
+      data?.error ||
+      (typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 220);
+    throw new Error(`Gemini HTTP ${res.status}: ${msg}`);
   }
-
-  const data = await res.json();
   const parts = data?.candidates?.[0]?.content?.parts;
   if (!parts?.length) {
     const fb = data?.promptFeedback;
@@ -428,28 +428,20 @@ async function searchRelated(topic) {
   const q = (topic || '').trim().slice(0, 200);
   if (!q) return { results: [], source: 'none' };
 
-  if (SERPER_API_KEY) {
-    try {
-      const res = await fetch('https://google.serper.dev/search', {
-        method: 'POST',
-        headers: {
-          'X-API-KEY': SERPER_API_KEY,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ q, num: 8 }),
-      });
-      if (!res.ok) throw new Error(`Serper ${res.status}`);
+  try {
+    const res = await fetch(API_SERPER, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q, num: 8 }),
+    });
+    if (res.ok) {
       const data = await res.json();
-      const organic = data.organic || [];
-      const results = organic.map((o) => ({
-        title: o.title,
-        url: o.link,
-        snippet: o.snippet || '',
-      }));
-      return { results, source: 'serper' };
-    } catch {
-      /* fall through */
+      if (data.configured && Array.isArray(data.results) && data.results.length) {
+        return { results: data.results, source: data.source || 'serper' };
+      }
     }
+  } catch {
+    /* Wikipedia fallback */
   }
 
   const wiki = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*`;
@@ -710,8 +702,20 @@ async function runAgent() {
   const textInput = document.getElementById('text-input').value.trim();
   const btn = document.getElementById('run-btn');
 
-  if (typeof GEMINI_API_KEY === 'undefined' || !GEMINI_API_KEY || GEMINI_API_KEY === 'your-key-here') {
-    alert('Set GEMINI_API_KEY in the <head> script at the top of this file (Google AI Studio key).');
+  let health = { gemini: false };
+  try {
+    const hr = await fetch(API_HEALTH);
+    health = await hr.json();
+  } catch {
+    alert(
+      'This page must be served with API routes. Deploy on Vercel or run `vercel dev` in the project folder — opening index.html as a local file will not work.'
+    );
+    return;
+  }
+  if (!health.gemini) {
+    alert(
+      'The server has no GEMINI_API_KEY. In Vercel: Project → Settings → Environment Variables → add GEMINI_API_KEY (Production + Preview). Redeploy after saving.'
+    );
     return;
   }
 

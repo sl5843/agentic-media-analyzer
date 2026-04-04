@@ -1,0 +1,5 @@
+{
+  "name": "agentic-media-analyzer",
+  "private": true,
+  "description": "Static UI + Vercel serverless proxies for Gemini / optional Serper"
+}
