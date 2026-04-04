@@ -321,7 +321,7 @@ const API_GEMINI = '/api/gemini';
 const API_HEALTH = '/api/health';
 const API_SERPER = '/api/serper';
 
-const ALLORIGINS = 'https://api.allorigins.win/get?url=';
+const ALLORIGINS_GET = 'https://api.allorigins.win/get?url=';
 
 const state = {
   reasoningLog: [],
@@ -399,26 +399,104 @@ function htmlToText(html) {
   }
 }
 
-async function fetchContent(url, attempt = 0) {
+function isMeaningfulBody(text) {
+  return text && typeof text === 'string' && text.replace(/\s+/g, ' ').trim().length >= 120;
+}
+
+/** When the page cannot be scraped, never feed error placeholders into search — use URL path + host. */
+function topicGuessFromUrl(u) {
+  try {
+    const parsed = new URL(u);
+    const stop = new Set([
+      'www', 'html', 'htm', 'php', 'aspx', 'index', 'article', 'articles', 'post', 'posts', 'page', 'news', 'story',
+      'id', 'p', 'q',
+    ]);
+    const segs = parsed.pathname.split(/[/\-_]+/).filter(Boolean);
+    const words = [];
+    for (const seg of segs) {
+      const base = decodeURIComponent(seg).replace(/\.[a-z0-9]+$/i, '');
+      for (const w of base.split(/[\-_.+]+/)) {
+        const t = w.replace(/[^a-zA-Z0-9]+/g, '').trim();
+        if (t.length > 2 && !stop.has(t.toLowerCase())) words.push(t);
+      }
+    }
+    const host = parsed.hostname.replace(/^www\./, '').split('.')[0] || '';
+    if (words.length) return words.slice(0, 8).join(' ');
+    if (host && host.length > 2) return host;
+  } catch {
+    /* ignore */
+  }
+  return 'current events';
+}
+
+function isBadSearchTopic(t) {
+  if (!t || typeof t !== 'string') return true;
+  const s = t.trim();
+  if (s.length < 3 || s.length > 120) return true;
+  if (/^\[URL|URL provided|body could not|content unavailable|metadata-only/i.test(s)) return true;
+  if (/^https?:\/\//i.test(s)) return true;
+  return false;
+}
+
+function isPlaceholderPrimaryContent(s) {
+  if (!s || typeof s !== 'string') return false;
+  return /^\[URL provided but body could not be retrieved:/.test(s.trim()) || /^\[URL:.*\]\s*—\s*content unavailable/i.test(s.trim());
+}
+
+async function fetchContent(url) {
   const enc = encodeURIComponent(url);
-  const proxyUrl = ALLORIGINS + enc;
-  const res = await fetch(proxyUrl);
-  if (!res.ok) throw new Error(`Proxy HTTP ${res.status}`);
-  const wrap = await res.json();
-  const raw = wrap.contents;
-  if (typeof raw !== 'string') throw new Error('Unexpected proxy payload');
-  return htmlToText(raw) || raw.slice(0, 50000);
+  const errors = [];
+
+  try {
+    const res = await fetch(ALLORIGINS_GET + enc);
+    if (res.ok) {
+      const wrap = await res.json();
+      const raw = wrap.contents;
+      if (typeof raw === 'string') {
+        const text = htmlToText(raw) || raw.slice(0, 50000);
+        if (isMeaningfulBody(text)) return text.trim();
+      }
+    } else errors.push(`allorigins-get:${res.status}`);
+  } catch (e) {
+    errors.push(`allorigins-get:${e.message}`);
+  }
+
+  try {
+    const res = await fetch(`https://api.allorigins.win/raw?url=${enc}`);
+    if (res.ok) {
+      const raw = await res.text();
+      const text = htmlToText(raw) || raw;
+      if (isMeaningfulBody(text)) return text.slice(0, 50000).trim();
+    } else errors.push(`allorigins-raw:${res.status}`);
+  } catch (e) {
+    errors.push(`allorigins-raw:${e.message}`);
+  }
+
+  try {
+    const res = await fetch('https://corsproxy.io/?' + encodeURIComponent(url), {
+      headers: { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+    });
+    if (res.ok) {
+      const raw = await res.text();
+      const text = htmlToText(raw) || raw;
+      if (isMeaningfulBody(text)) return text.slice(0, 50000).trim();
+    } else errors.push(`corsproxy:${res.status}`);
+  } catch (e) {
+    errors.push(`corsproxy:${e.message}`);
+  }
+
+  throw new Error(errors.length ? errors.join(' | ') : 'No proxy returned usable text');
 }
 
 async function fetchContentWithRetry(url) {
-  const max = 2;
+  const max = 3;
   let lastErr;
   for (let i = 0; i < max; i++) {
     try {
-      return await fetchContent(url, i);
+      return await fetchContent(url);
     } catch (e) {
       lastErr = e;
-      await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+      await new Promise((r) => setTimeout(r, 700 * (i + 1)));
     }
   }
   throw lastErr;
@@ -793,7 +871,7 @@ async function executeAgentPipeline(urlInput, textInput) {
   }
 
   addStep('plan', 'Planning research approach…', 'thinking');
-  const planPrompt = `You are an autonomous media research agent. Given the following primary content (or description), classify the medium and plan tools.
+  const planTask = `You are an autonomous media research agent. From the CONTENT below, classify the medium and plan tools.
 
 Output ONLY valid JSON (no markdown):
 {
@@ -801,14 +879,20 @@ Output ONLY valid JSON (no markdown):
   "rationale": "one sentence",
   "plannedSteps": ["short label", "..."],
   "extractionHints": ["what to look for in this content type"]
-}
+}`;
 
-Primary snippet:
-${truncate(primaryContent, 3500)}`;
+  let planContent;
+  if (textInput) {
+    planContent = truncate(primaryContent, 3500);
+  } else if (urlInput && isPlaceholderPrimaryContent(primaryContent)) {
+    planContent = `Submitted URL (page body not retrieved by proxy): ${urlInput}\nInfer article vs video vs social from domain and path; do not invent quoted body text.`;
+  } else {
+    planContent = truncate(primaryContent, 3500) + (urlInput ? `\nURL: ${urlInput}` : '');
+  }
 
   let plan;
   try {
-    const planRaw = await analyzeWithGemini(primaryContent || urlInput || '', planPrompt, { maxIn: 4000, temperature: 0.2 });
+    const planRaw = await analyzeWithGemini(planContent || urlInput || '', planTask, { maxIn: 4000, temperature: 0.2 });
     plan = parseJsonLoose(planRaw);
   } catch (e) {
     plan = {
@@ -841,13 +925,28 @@ ${truncate(primaryContent, 3500)}`;
   const topicTask = `From this content, propose 1 main search query (max 8 words) for finding related/competing coverage. Output JSON only: {"topic":"","authors":[],"mentionedTopics":[]}`;
   let topicBundle;
   try {
-    const topicRaw = await analyzeWithGemini(primaryContent, topicTask, { temperature: 0.2 });
+    const forTopic =
+      isPlaceholderPrimaryContent(primaryContent) && urlInput
+        ? `Article body was not fetched. URL only:\n${urlInput}\nInfer topic from domain + path (slug). Output a real topic phrase — never copy bracket text or error messages.`
+        : primaryContent;
+    const topicRaw = await analyzeWithGemini(forTopic, topicTask, { temperature: 0.2 });
     topicBundle = parseJsonLoose(topicRaw) || { topic: '', authors: [], mentionedTopics: [] };
   } catch (e) {
     topicBundle = { topic: '', authors: [], mentionedTopics: [] };
     logReasoning(`Topic extract error: ${e.message}`);
   }
-  const searchTopic = topicBundle.topic || (primaryContent || '').split(/\s+/).slice(0, 6).join(' ') || 'news';
+  let searchTopic = (topicBundle.topic || '').trim();
+  if (isBadSearchTopic(searchTopic)) {
+    if (urlInput) searchTopic = topicGuessFromUrl(urlInput);
+    else {
+      const words = (primaryContent || '')
+        .split(/\s+/)
+        .filter((w) => w.length > 2 && !/^\[URL/.test(w))
+        .slice(0, 6);
+      searchTopic = words.join(' ') || 'news';
+    }
+  }
+  if (isBadSearchTopic(searchTopic)) searchTopic = 'news';
   finishStep('links', `Found ${links.length} URLs; topics scoped`, `Search focus: “${searchTopic}”`);
   logReasoning(`Links: ${links.length}, topic: ${searchTopic}`);
   const auth = (topicBundle.authors || []).slice(0, 3).join(', ');
