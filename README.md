@@ -11,6 +11,12 @@ GitHub cannot be created from this machine until you log in there. Do this once:
 5. In PowerShell, from this folder, run: `.\push-to-github.ps1`  
    (If GitHub asks for login, use a [Personal Access Token](https://github.com/settings/tokens) as the password when `git push` prompts you.)
 
+**If push says “Permission denied” for the wrong username:** Windows saved another GitHub account. Run:
+
+`git config --global credential.https://github.com.username sl5843`
+
+Then remove old GitHub entries: **Windows Search → Credential Manager → Windows Credentials** → find `git:https://github.com` (or similar) → **Remove**. Push again and sign in as **sl5843** (token as password).
+
 ---
 
 Single-page UI plus **Vercel serverless** proxies. The browser never sees your Gemini (or Serper) keys — they live only in **environment variables** on Vercel (or in a local `.env.local` for `vercel dev`).
