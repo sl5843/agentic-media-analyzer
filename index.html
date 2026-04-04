@@ -79,6 +79,21 @@
     }
     .input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
 
+    .options-row {
+      align-items: center;
+    }
+    .slow-opt {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.5rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      cursor: pointer;
+      user-select: none;
+      max-width: 52rem;
+    }
+    .slow-opt input { margin-top: 0.2rem; flex-shrink: 0; }
+
     .layout {
       display: grid;
       grid-template-columns: minmax(300px, 380px) 1fr;
@@ -289,6 +304,14 @@
         <textarea id="text-input" placeholder="Or paste raw text / social post / transcript here (skips fetch)"></textarea>
         <button type="button" id="run-btn">Run agent</button>
       </div>
+      <div class="input-row options-row">
+        <label class="slow-opt">
+          <input type="checkbox" id="slow-pace" checked />
+          <span
+            ><strong>Slower API pacing</strong> (on by default): waits several seconds between each model call so free-tier <abbr title="tokens per minute">TPM</abbr>/<abbr title="requests per minute">RPM</abbr> limits are less likely to trip. Runs take longer but usually fewer 429 errors. Uncheck for fastest runs if your quota allows.</span
+          >
+        </label>
+      </div>
     </header>
 
     <div class="layout">
@@ -334,7 +357,20 @@ const state = {
   geminiNextSlot: 0,
   /** 'groq' | 'gemini' — set from /api/health on each run (Groq preferred when both keys exist) */
   llmBackend: null,
+  /** From #slow-pace — longer gaps between LLM calls for free tiers */
+  slowPace: true,
 };
+
+const LS_LAST_RUN = 'media-analyzer-last-run-at';
+const SLOW_COOLDOWN_MS = 40000;
+
+/** Milliseconds to wait after a successful LLM response before the next request. */
+function afterLlmSuccessGapMs() {
+  if (!state.slowPace) {
+    return state.llmBackend === 'groq' ? 800 : 600;
+  }
+  return state.llmBackend === 'groq' ? 6500 : 4000;
+}
 
 function logReasoning(line) {
   const ts = new Date().toISOString();
@@ -458,7 +494,7 @@ async function analyzeWithGroqChat(content, task, options = {}) {
               : 1500 * (attempt + 1);
           logReasoning(`Groq ${res.status}, waiting ~${Math.round(waitMs / 1000)}s before retry ${attempt + 2}/${maxAttempts}`);
           await new Promise((r) => setTimeout(r, waitMs));
-          state.geminiNextSlot = Date.now() + 900;
+          state.geminiNextSlot = Date.now() + (state.slowPace ? 2500 : 900);
           lastErr = new Error(`Groq HTTP ${res.status}: ${msg}`);
           continue;
         }
@@ -474,7 +510,7 @@ async function analyzeWithGroqChat(content, task, options = {}) {
         }
         throw err;
       }
-      state.geminiNextSlot = Date.now() + 750;
+      state.geminiNextSlot = Date.now() + afterLlmSuccessGapMs();
       return String(text);
     } catch (e) {
       if (e.message && /Failed to fetch|network/i.test(e.message) && attempt < maxAttempts - 1) {
@@ -549,7 +585,7 @@ async function analyzeWithGemini(content, task, options = {}) {
             res.status === 429 ? parseRetryDelayMsFromMessage(fullMsg) : 1500 * (attempt + 1);
           logReasoning(`Gemini ${res.status}, waiting ~${Math.round(waitMs / 1000)}s before retry ${attempt + 2}/${maxAttempts}`);
           await new Promise((r) => setTimeout(r, waitMs));
-          state.geminiNextSlot = Date.now() + 600;
+          state.geminiNextSlot = Date.now() + (state.slowPace ? 2000 : 600);
           lastErr = new Error(`Gemini HTTP ${res.status}: ${msg}`);
           continue;
         }
@@ -568,7 +604,7 @@ async function analyzeWithGemini(content, task, options = {}) {
         }
         throw err;
       }
-      state.geminiNextSlot = Date.now() + 550;
+      state.geminiNextSlot = Date.now() + afterLlmSuccessGapMs();
       return parts.map((p) => p.text || '').join('');
     } catch (e) {
       if (e.message && /Failed to fetch|network/i.test(e.message) && attempt < maxAttempts - 1) {
@@ -1045,6 +1081,25 @@ async function runAgent() {
     }
   }
 
+  const slowPaceEl = document.getElementById('slow-pace');
+  state.slowPace = !!(slowPaceEl && slowPaceEl.checked);
+
+  if (state.slowPace) {
+    try {
+      const last = parseInt(localStorage.getItem(LS_LAST_RUN) || '0', 10);
+      const now = Date.now();
+      if (last > 0 && now - last < SLOW_COOLDOWN_MS) {
+        const sec = Math.ceil((SLOW_COOLDOWN_MS - (now - last)) / 1000);
+        alert(
+          `To reduce free-tier 429 errors, wait about ${sec}s before another full run — or uncheck “Slower API pacing” to skip this cooldown (faster, but easier to hit limits).`
+        );
+        return;
+      }
+    } catch {
+      /* private mode / no storage */
+    }
+  }
+
   btn.disabled = true;
   document.getElementById('agent-log').innerHTML = '';
   state.stepEls.clear();
@@ -1062,6 +1117,11 @@ async function runAgent() {
     logReasoning(`FATAL: ${e.message}`);
   } finally {
     btn.disabled = false;
+    try {
+      localStorage.setItem(LS_LAST_RUN, String(Date.now()));
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -1113,6 +1173,12 @@ async function executeAgentPipeline(urlInput, textInput) {
     primaryContent =
       primaryContent.slice(0, MAX_PRIMARY_STORE) + '\n\n[…trimmed to save API tokens; original page was longer…]';
     logReasoning(`Primary text capped at ${MAX_PRIMARY_STORE} characters for LLM quota`);
+  }
+
+  if (state.slowPace) {
+    logReasoning(
+      `Slow pacing: ~${Math.round(afterLlmSuccessGapMs() / 1000)}s between ${state.llmBackend} calls; ${Math.round(SLOW_COOLDOWN_MS / 1000)}s min between full runs`
+    );
   }
 
   addStep(

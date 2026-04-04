@@ -66,6 +66,7 @@ Then open the URL Vercel prints (usually `http://localhost:3000`).
 
 The pipeline is **batched** to limit LLM calls per run: plan+topic (1), cross-source compare (1), sentiment+reflection (1), final report (1), plus optional gap-fill (no LLM). It fetches **2** related pages (not 3) and caps primary text before analysis. **Free tiers** (Gemini or Groq) still have per-minute and daily caps; long pages burn tokens faster. If you see **429**:
 
+- In the UI, leave **“Slower API pacing”** checked (default): it spaces model calls and enforces a short cooldown between full runs so free-tier **TPM/RPM** limits are hit less often (no cost; runs take longer).
 - Add **`GROQ_API_KEY`** and redeploy — the app will use Groq first when both Groq and Gemini keys exist.
 - For Gemini only: wait, enable **billing**, or change **`GEMINI_MODEL`** ([Gemini rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)).
 - For Groq only: see [Groq rate limits](https://console.groq.com/docs/rate-limits).
