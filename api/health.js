@@ -6,6 +6,7 @@ module.exports = async (req, res) => {
   }
   return res.status(200).json({
     gemini: Boolean(process.env.GEMINI_API_KEY),
+    groq: Boolean(process.env.GROQ_API_KEY),
     serper: Boolean(process.env.SERPER_API_KEY),
   });
 };

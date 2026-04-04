@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Agentic Media Analyzer — Gemini 2.0 Flash</title>
+  <title>Agentic Media Analyzer — Groq or Gemini</title>
   <style>
     :root {
       --bg: #0a0e14;
@@ -281,7 +281,7 @@
   <div class="wrap">
     <header>
       <h1>Agentic media analyzer</h1>
-      <p>Autonomous research loop powered by Gemini 2.0 Flash — plan, execute, reflect, report.</p>
+      <p>Autonomous research loop — uses <strong>Groq</strong> when <code>GROQ_API_KEY</code> is set (recommended free tier), otherwise <strong>Gemini 2.0 Flash</strong>.</p>
       <div class="input-row">
         <input type="url" id="url-input" placeholder="https://… article or page URL" autocomplete="off" />
       </div>
@@ -318,6 +318,7 @@
 const GEMINI_MODEL = 'gemini-2.0-flash';
 /** Same-origin API (Vercel serverless). Keys live in Vercel env, not in the browser. */
 const API_GEMINI = '/api/gemini';
+const API_GROQ = '/api/groq';
 const API_HEALTH = '/api/health';
 const API_SERPER = '/api/serper';
 
@@ -327,6 +328,12 @@ const state = {
   reasoningLog: [],
   sourceNodes: [],
   stepEls: new Map(),
+  /** Set when Gemini returns 429 / quota — shown in final report */
+  lastQuotaError: null,
+  /** Minimum time before next LLM request (spacing to avoid burst RPM limits) */
+  geminiNextSlot: 0,
+  /** 'groq' | 'gemini' — set from /api/health on each run (Groq preferred when both keys exist) */
+  llmBackend: null,
 };
 
 function logReasoning(line) {
@@ -345,40 +352,231 @@ function stripCodeFences(text) {
   return m ? m[1].trim() : t;
 }
 
-async function analyzeWithGemini(content, task, options = {}) {
-  const sys = options.systemHint || '';
-  const prompt = sys
-    ? `${sys}\n\n---\nTASK: ${task}\n\n---\nCONTENT:\n${truncate(content, options.maxIn || 14000)}`
-    : `TASK: ${task}\n\n---\nCONTENT:\n${truncate(content, options.maxIn || 14000)}`;
+/** Pull first balanced {...} from text (handles prose + markdown around JSON). */
+function extractBalancedJson(s) {
+  const str = typeof s === 'string' ? s : '';
+  const start = str.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let q = '';
+  for (let i = start; i < str.length; i++) {
+    const c = str[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === q) inStr = false;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inStr = true;
+      q = c;
+      continue;
+    }
+    if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return str.slice(start, i + 1);
+    }
+  }
+  return null;
+}
 
-  const body = {
-    contents: [{ role: 'user', parts: [{ text: prompt }] }],
-    generationConfig: {
+function parseGeminiRetryDelayMs(apiMessage) {
+  const s = apiMessage == null ? '' : String(apiMessage);
+  const m = s.match(/retry in ([\d.]+)\s*s/i);
+  if (m) {
+    const sec = parseFloat(m[1], 10);
+    if (!Number.isNaN(sec)) {
+      return Math.min(120000, Math.max(3000, (Math.ceil(sec) + 2) * 1000));
+    }
+  }
+  return 35000;
+}
+
+function isGeminiQuotaErrorText(message) {
+  const m = message == null ? '' : String(message);
+  return /429|quota|exceeded|rate.limit|Resource exhausted|free_tier|limit:\s*0/i.test(m);
+}
+
+async function analyzeWithGroqChat(content, task, options = {}) {
+  const maxAttempts = options.retries ?? 5;
+  const sys = options.systemHint || '';
+  const maxIn = options.maxIn || 14000;
+  const basePrompt = sys
+    ? `${sys}\n\n---\nTASK: ${task}\n\n---\nCONTENT:\n${truncate(content, maxIn)}`
+    : `TASK: ${task}\n\n---\nCONTENT:\n${truncate(content, maxIn)}`;
+
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const t0 = Date.now();
+    if (t0 < state.geminiNextSlot) {
+      await new Promise((r) => setTimeout(r, state.geminiNextSlot - t0));
+    }
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, 400 * attempt + Math.random() * 300));
+    }
+
+    const body = {
+      messages: [{ role: 'user', content: basePrompt }],
+      temperature: options.temperature ?? 0.35,
+      max_tokens: Math.min(options.maxOut ?? 8192, 8192),
+    };
+    if (options.json) {
+      body.response_format = { type: 'json_object' };
+    }
+
+    try {
+      const res = await fetch(API_GROQ, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const fullMsg =
+          typeof data?.error?.message === 'string'
+            ? data.error.message
+            : typeof data?.error === 'object'
+              ? JSON.stringify(data.error)
+              : JSON.stringify(data?.error || data);
+        const msg = fullMsg.length > 900 ? fullMsg.slice(0, 900) + '…' : fullMsg;
+        const retryable =
+          res.status === 429 ||
+          res.status === 503 ||
+          /rate.limit|quota|too many requests|capacity/i.test(fullMsg);
+        if (retryable) {
+          state.lastQuotaError = fullMsg;
+        }
+        if (retryable && attempt < maxAttempts - 1) {
+          const waitMs = res.status === 429 ? 10000 + attempt * 8000 : 1500 * (attempt + 1);
+          logReasoning(`Groq ${res.status}, waiting ~${Math.round(waitMs / 1000)}s before retry ${attempt + 2}/${maxAttempts}`);
+          await new Promise((r) => setTimeout(r, waitMs));
+          state.geminiNextSlot = Date.now() + 500;
+          lastErr = new Error(`Groq HTTP ${res.status}: ${msg}`);
+          continue;
+        }
+        throw new Error(`Groq HTTP ${res.status}: ${msg}`);
+      }
+
+      const text = data?.choices?.[0]?.message?.content;
+      if (text == null || String(text).trim() === '') {
+        const err = new Error('Empty Groq response');
+        if (attempt < maxAttempts - 1) {
+          lastErr = err;
+          continue;
+        }
+        throw err;
+      }
+      state.geminiNextSlot = Date.now() + 400;
+      return String(text);
+    } catch (e) {
+      if (e.message && /Failed to fetch|network/i.test(e.message) && attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+        lastErr = e;
+        continue;
+      }
+      if (attempt === maxAttempts - 1) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('Groq request failed');
+}
+
+async function analyzeWithGemini(content, task, options = {}) {
+  if (state.llmBackend === 'groq') {
+    return analyzeWithGroqChat(content, task, options);
+  }
+  const maxAttempts = options.retries ?? 5;
+  const sys = options.systemHint || '';
+  const maxIn = options.maxIn || 14000;
+  const basePrompt = sys
+    ? `${sys}\n\n---\nTASK: ${task}\n\n---\nCONTENT:\n${truncate(content, maxIn)}`
+    : `TASK: ${task}\n\n---\nCONTENT:\n${truncate(content, maxIn)}`;
+
+  let lastErr;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const t0 = Date.now();
+    if (t0 < state.geminiNextSlot) {
+      await new Promise((r) => setTimeout(r, state.geminiNextSlot - t0));
+    }
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, 400 * attempt + Math.random() * 300));
+    }
+    const generationConfig = {
       temperature: options.temperature ?? 0.35,
       maxOutputTokens: options.maxOut ?? 8192,
-    },
-  };
+    };
+    if (options.json) {
+      generationConfig.responseMimeType = 'application/json';
+    }
+    const body = {
+      contents: [{ role: 'user', parts: [{ text: basePrompt }] }],
+      generationConfig,
+    };
 
-  const res = await fetch(`${API_GEMINI}?model=${encodeURIComponent(GEMINI_MODEL)}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+    try {
+      const res = await fetch(`${API_GEMINI}?model=${encodeURIComponent(GEMINI_MODEL)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    const msg =
-      data?.error?.message ||
-      data?.error ||
-      (typeof data === 'string' ? data : JSON.stringify(data)).slice(0, 220);
-    throw new Error(`Gemini HTTP ${res.status}: ${msg}`);
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const fullMsg =
+          typeof data?.error?.message === 'string'
+            ? data.error.message
+            : typeof data?.error === 'string'
+              ? data.error
+              : JSON.stringify(data?.error || data);
+        const msg = fullMsg.length > 900 ? fullMsg.slice(0, 900) + '…' : fullMsg;
+        const retryable =
+          res.status === 429 ||
+          res.status === 503 ||
+          /Resource exhausted|rate|quota|exceeded your current quota/i.test(fullMsg);
+        if (isGeminiQuotaErrorText(fullMsg)) {
+          state.lastQuotaError = fullMsg;
+        }
+        if (retryable && attempt < maxAttempts - 1) {
+          const waitMs =
+            res.status === 429 ? parseGeminiRetryDelayMs(fullMsg) : 1500 * (attempt + 1);
+          logReasoning(`Gemini ${res.status}, waiting ~${Math.round(waitMs / 1000)}s before retry ${attempt + 2}/${maxAttempts}`);
+          await new Promise((r) => setTimeout(r, waitMs));
+          state.geminiNextSlot = Date.now() + 600;
+          lastErr = new Error(`Gemini HTTP ${res.status}: ${msg}`);
+          continue;
+        }
+        throw new Error(`Gemini HTTP ${res.status}: ${msg}`);
+      }
+      const parts = data?.candidates?.[0]?.content?.parts;
+      if (!parts?.length) {
+        const fb = data?.promptFeedback;
+        const reason = data?.candidates?.[0]?.finishReason;
+        const err = new Error(
+          fb ? `Gemini blocked: ${JSON.stringify(fb)}` : reason ? `Empty response (${reason})` : 'Empty Gemini response'
+        );
+        if (attempt < maxAttempts - 1) {
+          lastErr = err;
+          continue;
+        }
+        throw err;
+      }
+      state.geminiNextSlot = Date.now() + 550;
+      return parts.map((p) => p.text || '').join('');
+    } catch (e) {
+      if (e.message && /Failed to fetch|network/i.test(e.message) && attempt < maxAttempts - 1) {
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+        lastErr = e;
+        continue;
+      }
+      if (attempt === maxAttempts - 1) throw e;
+      lastErr = e;
+    }
   }
-  const parts = data?.candidates?.[0]?.content?.parts;
-  if (!parts?.length) {
-    const fb = data?.promptFeedback;
-    throw new Error(fb ? `Gemini blocked: ${JSON.stringify(fb)}` : 'Empty Gemini response');
-  }
-  return parts.map((p) => p.text || '').join('');
+  throw lastErr || new Error('Gemini request failed');
 }
 
 function extractLinks(content) {
@@ -537,9 +735,9 @@ async function searchRelated(topic) {
 
 async function compareContent(source1, source2) {
   const task =
-    'Compare and contrast these two sources. Output JSON only: {"agreements":[],"disagreements":[],"uniqueClaims1":[],"uniqueClaims2":[],"toneComparison":""}';
-  const combined = `SOURCE A:\n${truncate(source1, 6000)}\n\nSOURCE B:\n${truncate(source2, 6000)}`;
-  const raw = await analyzeWithGemini(combined, task, { temperature: 0.2 });
+    'Compare and contrast SOURCE A vs SOURCE B. Return JSON with keys: agreements (string array), disagreements (string array), uniqueClaims1, uniqueClaims2 (string arrays), toneComparison (string). No extra keys or prose outside JSON.';
+  const combined = `SOURCE A:\n${truncate(source1, 3200)}\n\nSOURCE B:\n${truncate(source2, 3200)}`;
+  const raw = await analyzeWithGemini(combined, task, { temperature: 0.2, json: true, maxOut: 4096, retries: 5 });
   let parsed;
   try {
     parsed = JSON.parse(stripCodeFences(raw));
@@ -738,10 +936,22 @@ function removeLiveBuildSection() {
 }
 
 function parseJsonLoose(text) {
-  const s = stripCodeFences(text);
+  if (text == null || text === '') return null;
+  let s = String(text).trim();
+  const fenced = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) s = fenced[1].trim();
+  else s = stripCodeFences(s);
   try {
     return JSON.parse(s);
   } catch {
+    const balanced = extractBalancedJson(s);
+    if (balanced) {
+      try {
+        return JSON.parse(balanced);
+      } catch {
+        /* fall through */
+      }
+    }
     const start = s.indexOf('{');
     const end = s.lastIndexOf('}');
     if (start >= 0 && end > start) {
@@ -761,7 +971,7 @@ async function agentHandleToolError(toolName, err, context) {
     const msg = await analyzeWithGemini(
       `Tool: ${toolName}\nContext: ${context}\nError: ${err.message}`,
       'You are the agent. In plain English (no raw error codes), explain what went wrong and what you will do instead: retry, skip, or use an alternative. Output JSON only: {"userMessage":"","decision":"retry|skip|alternative","followUp":""}',
-      { maxIn: 800, temperature: 0.3 }
+      { maxIn: 800, temperature: 0.3, json: true, retries: 3 }
     );
     return parseJsonLoose(msg) || { userMessage: 'That step did not finish; moving on with what we already have.', decision: 'skip', followUp: '' };
   } catch {
@@ -780,7 +990,7 @@ async function runAgent() {
   const textInput = document.getElementById('text-input').value.trim();
   const btn = document.getElementById('run-btn');
 
-  let health = { gemini: false };
+  let health = { gemini: false, groq: false };
   try {
     const hr = await fetch(API_HEALTH);
     health = await hr.json();
@@ -790,9 +1000,9 @@ async function runAgent() {
     );
     return;
   }
-  if (!health.gemini) {
+  if (!health.gemini && !health.groq) {
     alert(
-      'The server has no GEMINI_API_KEY. In Vercel: Project → Settings → Environment Variables → add GEMINI_API_KEY (Production + Preview). Redeploy after saving.'
+      'Add at least one LLM key in Vercel → Settings → Environment Variables: GROQ_API_KEY (recommended, separate free tier) and/or GEMINI_API_KEY. Enable Production + Preview, then redeploy.'
     );
     return;
   }
@@ -815,7 +1025,11 @@ async function runAgent() {
   document.getElementById('agent-log').innerHTML = '';
   state.stepEls.clear();
   state.reasoningLog = [];
+  state.lastQuotaError = null;
+  state.geminiNextSlot = 0;
   clearReport();
+
+  state.llmBackend = health.groq ? 'groq' : 'gemini';
 
   try {
     await executeAgentPipeline(urlInput, textInput);
@@ -870,6 +1084,20 @@ async function executeAgentPipeline(urlInput, textInput) {
     }
   }
 
+  const MAX_PRIMARY_STORE = 18000;
+  if (primaryContent.length > MAX_PRIMARY_STORE) {
+    primaryContent =
+      primaryContent.slice(0, MAX_PRIMARY_STORE) + '\n\n[…trimmed to save API tokens; original page was longer…]';
+    logReasoning(`Primary text capped at ${MAX_PRIMARY_STORE} characters for LLM quota`);
+  }
+
+  addStep(
+    'llm',
+    state.llmBackend === 'groq' ? 'Using Groq (Llama) for this run…' : 'Using Google Gemini for this run…',
+    'done',
+    state.llmBackend === 'groq' ? 'Server has GROQ_API_KEY' : 'Server has GEMINI_API_KEY'
+  );
+
   addStep('plan', 'Planning research approach…', 'thinking');
   const planTask = `You are an autonomous media research agent. From the CONTENT below, classify the medium and plan tools.
 
@@ -892,7 +1120,12 @@ Output ONLY valid JSON (no markdown):
 
   let plan;
   try {
-    const planRaw = await analyzeWithGemini(planContent || urlInput || '', planTask, { maxIn: 4000, temperature: 0.2 });
+    const planRaw = await analyzeWithGemini(planContent || urlInput || '', planTask, {
+      maxIn: 4000,
+      temperature: 0.2,
+      json: true,
+      retries: 5,
+    });
     plan = parseJsonLoose(planRaw);
   } catch (e) {
     plan = {
@@ -929,7 +1162,7 @@ Output ONLY valid JSON (no markdown):
       isPlaceholderPrimaryContent(primaryContent) && urlInput
         ? `Article body was not fetched. URL only:\n${urlInput}\nInfer topic from domain + path (slug). Output a real topic phrase — never copy bracket text or error messages.`
         : primaryContent;
-    const topicRaw = await analyzeWithGemini(forTopic, topicTask, { temperature: 0.2 });
+    const topicRaw = await analyzeWithGemini(forTopic, topicTask, { temperature: 0.2, json: true, retries: 5 });
     topicBundle = parseJsonLoose(topicRaw) || { topic: '', authors: [], mentionedTopics: [] };
   } catch (e) {
     topicBundle = { topic: '', authors: [], mentionedTopics: [] };
@@ -1026,7 +1259,7 @@ Output ONLY valid JSON (no markdown):
     const sentRaw = await analyzeWithGemini(
       `PRIMARY:\n${primaryChunk}\n\n${sentBlob}`,
       sentTask,
-      { temperature: 0.2 }
+      { temperature: 0.2, json: true, retries: 5, maxIn: 12000 }
     );
     sentiment = parseJsonLoose(sentRaw) || {};
   } catch (e) {
@@ -1052,7 +1285,12 @@ Sentiment: ${JSON.stringify(sentiment).slice(0, 1500)}`;
 
     let reflection;
     try {
-      const refRaw = await analyzeWithGemini(primaryContent, reflectPrompt, { maxIn: 6000, temperature: 0.25 });
+      const refRaw = await analyzeWithGemini(primaryContent, reflectPrompt, {
+        maxIn: 6000,
+        temperature: 0.25,
+        json: true,
+        retries: 5,
+      });
       reflection = parseJsonLoose(refRaw);
     } catch (e) {
       reflection = { satisfied: true, confidence: 60, gaps: [], nextQueries: [], narrative: 'Proceeding with available data.' };
@@ -1126,7 +1364,13 @@ Context:
 
   let reportJson;
   try {
-    const reportRaw = await analyzeWithGemini('Synthesize.', reportPrompt, { maxIn: 8000, temperature: 0.35 });
+    const reportRaw = await analyzeWithGemini('Synthesize.', reportPrompt, {
+      maxIn: 8000,
+      temperature: 0.35,
+      json: true,
+      retries: 5,
+      maxOut: 8192,
+    });
     reportJson = parseJsonLoose(reportRaw);
   } catch (e) {
     reportJson = null;
@@ -1144,6 +1388,8 @@ Context:
     finalConfidence: typeof finalConfidence === 'number' ? finalConfidence : reportJson?.agentConfidence,
     relatedBodies,
     extraSnippets,
+    searchTopic,
+    quotaError: state.lastQuotaError,
   });
 
   const pre = document.createElement('pre');
@@ -1162,12 +1408,37 @@ function renderFinalReport(reportJson, ctx) {
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;');
 
+  if (ctx.quotaError) {
+    const vendor = state.llmBackend === 'groq' ? 'Groq' : 'Google Gemini';
+    appendReportSection(
+      'API quota / rate limit',
+      '<p><strong>' +
+        esc(vendor) +
+        ' returned HTTP 429 — quota or rate limit exceeded.</strong> This app makes many model calls per run (plan, topic, compare×3, sentiment, reflect, report). Free tiers have per-minute and daily caps; long pages use more input tokens per call.</p>' +
+        '<ul>' +
+        '<li>Wait a few minutes (or until the next daily window) and try again.</li>' +
+        '<li>If using Gemini: enable billing or check <a href="https://ai.google.dev/gemini-api/docs/rate-limits" target="_blank" rel="noopener">Gemini rate limits</a>. If using Groq: see <a href="https://console.groq.com/docs/rate-limits" target="_blank" rel="noopener">Groq rate limits</a>.</li>' +
+        '<li>Or add <strong>GROQ_API_KEY</strong> on Vercel to switch off a maxed-out Gemini free tier (Groq is used first when both keys are set).</li>' +
+        '<li>Paste a <strong>short excerpt</strong> as text instead of a huge page to cut input tokens.</li>' +
+        '</ul>' +
+        '<p class="evidence">Last error (truncated): ' +
+        esc((ctx.quotaError || '').slice(0, 400)) +
+        '</p>'
+    );
+  }
+
   if (!reportJson) {
+    const why = ctx.quotaError
+      ? 'Gemini could not complete the final JSON report, likely due to quota limits above.'
+      : 'The model could not return structured JSON; showing key facts from the run.';
+    const topicShow = ctx.topicBundle?.topic || ctx.searchTopic || '—';
     appendReportSection(
       'Executive summary',
-      '<p>The model could not return structured JSON; showing key facts from the run.</p><ul>' +
+      '<p>' +
+        esc(why) +
+        '</p><ul>' +
         `<li>Input type: ${esc(ctx.plan?.inputType)}</li>` +
-        `<li>Focus topic: ${esc(ctx.topicBundle?.topic)}</li>` +
+        `<li>Focus topic: ${esc(topicShow)}</li>` +
         `<li>Related sources loaded: ${ctx.relatedBodies?.length || 0}</li></ul>`
     );
   } else {
