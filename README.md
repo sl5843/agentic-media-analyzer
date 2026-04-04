@@ -64,7 +64,7 @@ Then open the URL Vercel prints (usually `http://localhost:3000`).
 
 ## LLM quota (HTTP 429)
 
-This agent issues **many** LLM calls per run. **Free tiers** (Gemini or Groq) have per-minute and daily caps; long pages burn input tokens faster. If you see **429**:
+The pipeline is **batched** to limit LLM calls per run: plan+topic (1), cross-source compare (1), sentiment+reflection (1), final report (1), plus optional gap-fill (no LLM). It fetches **2** related pages (not 3) and caps primary text before analysis. **Free tiers** (Gemini or Groq) still have per-minute and daily caps; long pages burn tokens faster. If you see **429**:
 
 - Add **`GROQ_API_KEY`** and redeploy — the app will use Groq first when both Groq and Gemini keys exist.
 - For Gemini only: wait, enable **billing**, or change **`GEMINI_MODEL`** ([Gemini rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)).

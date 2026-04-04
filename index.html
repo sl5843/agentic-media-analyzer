@@ -737,18 +737,38 @@ async function searchRelated(topic) {
   return { results, source: 'wikipedia' };
 }
 
-async function compareContent(source1, source2) {
+/** One LLM call for all primary-vs-related comparisons (fewer RPM/TPM hits than pairwise). */
+async function compareAllSourcesBatch(primaryChunk, relatedBodies) {
+  if (!relatedBodies || !relatedBodies.length) return [];
   const task =
-    'Compare and contrast SOURCE A vs SOURCE B. Return JSON with keys: agreements (string array), disagreements (string array), uniqueClaims1, uniqueClaims2 (string arrays), toneComparison (string). No extra keys or prose outside JSON.';
-  const combined = `SOURCE A:\n${truncate(source1, 3200)}\n\nSOURCE B:\n${truncate(source2, 3200)}`;
-  const raw = await analyzeWithGemini(combined, task, { temperature: 0.2, json: true, maxOut: 4096, retries: 5 });
-  let parsed;
+    'Compare PRIMARY to each RELATED excerpt below. Return JSON only: {"comparisons":[{"source":"<url>","agreements":[],"disagreements":[],"uniqueClaimsPrimary":[],"uniqueClaimsRelated":[],"toneComparison":""}]}. One object per RELATED in order (RELATED_0 first); source must be that excerpt\'s URL.';
+  const parts = relatedBodies.map(
+    (r, i) => `RELATED_${i} (${r.url}):\n${truncate(r.body || r.snippet, 1200)}`
+  );
+  const content = `PRIMARY:\n${truncate(primaryChunk, 3000)}\n\n${parts.join('\n\n---\n\n')}`;
   try {
-    parsed = JSON.parse(stripCodeFences(raw));
-  } catch {
-    parsed = { agreements: [], disagreements: [], rawComparison: raw };
+    const raw = await analyzeWithGemini(content, task, {
+      temperature: 0.2,
+      json: true,
+      maxOut: 5000,
+      retries: 5,
+      maxIn: 16000,
+    });
+    const parsed = parseJsonLoose(raw);
+    const arr = parsed?.comparisons;
+    if (!Array.isArray(arr)) return [];
+    return arr.map((c, i) => ({
+      source: c.source || relatedBodies[i]?.url || '',
+      agreements: c.agreements || [],
+      disagreements: c.disagreements || [],
+      uniqueClaims1: c.uniqueClaimsPrimary || c.uniqueClaims1,
+      uniqueClaims2: c.uniqueClaimsRelated || c.uniqueClaims2,
+      toneComparison: c.toneComparison || '',
+    }));
+  } catch (e) {
+    logReasoning(`Batch compare fail: ${e.message}`);
+    return [];
   }
-  return parsed;
 }
 
 function addStep(id, message, status = 'thinking', note = '') {
@@ -1088,7 +1108,7 @@ async function executeAgentPipeline(urlInput, textInput) {
     }
   }
 
-  const MAX_PRIMARY_STORE = 18000;
+  const MAX_PRIMARY_STORE = 12000;
   if (primaryContent.length > MAX_PRIMARY_STORE) {
     primaryContent =
       primaryContent.slice(0, MAX_PRIMARY_STORE) + '\n\n[…trimmed to save API tokens; original page was longer…]';
@@ -1102,43 +1122,58 @@ async function executeAgentPipeline(urlInput, textInput) {
     state.llmBackend === 'groq' ? 'Server has GROQ_API_KEY' : 'Server has GEMINI_API_KEY'
   );
 
-  addStep('plan', 'Planning research approach…', 'thinking');
-  const planTask = `You are an autonomous media research agent. From the CONTENT below, classify the medium and plan tools.
+  addStep('plan', 'Planning + topic scope (single model request)…', 'thinking');
+  const planTopicTask = `You are an autonomous media research agent. From the CONTENT below, do BOTH in one JSON object:
 
-Output ONLY valid JSON (no markdown):
-{
-  "inputType": "article|video|social|image|unknown",
-  "rationale": "one sentence",
-  "plannedSteps": ["short label", "..."],
-  "extractionHints": ["what to look for in this content type"]
-}`;
+1) Classify medium and plan: inputType (article|video|social|image|unknown), rationale (one sentence), plannedSteps (short labels), extractionHints (strings).
 
-  let planContent;
+2) Propose one search query for related coverage: topic (max 8 words), authors (strings), mentionedTopics (strings).
+
+Return ONE JSON with all keys: inputType, rationale, plannedSteps, extractionHints, topic, authors, mentionedTopics.`;
+
+  let planTopicContent;
   if (textInput) {
-    planContent = truncate(primaryContent, 3500);
+    planTopicContent = truncate(primaryContent, 3800);
   } else if (urlInput && isPlaceholderPrimaryContent(primaryContent)) {
-    planContent = `Submitted URL (page body not retrieved by proxy): ${urlInput}\nInfer article vs video vs social from domain and path; do not invent quoted body text.`;
+    planTopicContent = `Submitted URL (page body not retrieved by proxy): ${urlInput}\nInfer type from domain/path; infer topic from URL slug — never echo error placeholders.`;
   } else {
-    planContent = truncate(primaryContent, 3500) + (urlInput ? `\nURL: ${urlInput}` : '');
+    planTopicContent = truncate(primaryContent, 3800) + (urlInput ? `\nURL: ${urlInput}` : '');
   }
 
   let plan;
+  let topicBundle;
   try {
-    const planRaw = await analyzeWithGemini(planContent || urlInput || '', planTask, {
-      maxIn: 4000,
+    const planTopicRaw = await analyzeWithGemini(planTopicContent || urlInput || '', planTopicTask, {
+      maxIn: 4500,
       temperature: 0.2,
       json: true,
       retries: 5,
     });
-    plan = parseJsonLoose(planRaw);
+    const merged = parseJsonLoose(planTopicRaw);
+    if (merged && typeof merged === 'object') {
+      plan = {
+        inputType: merged.inputType || 'unknown',
+        rationale: merged.rationale || '',
+        plannedSteps: merged.plannedSteps || [],
+        extractionHints: merged.extractionHints || [],
+      };
+      topicBundle = {
+        topic: merged.topic || '',
+        authors: Array.isArray(merged.authors) ? merged.authors : [],
+        mentionedTopics: Array.isArray(merged.mentionedTopics) ? merged.mentionedTopics : [],
+      };
+    } else {
+      throw new Error('Unparseable plan+topic JSON');
+    }
   } catch (e) {
     plan = {
       inputType: 'unknown',
-      rationale: 'Fallback plan after planning model error.',
+      rationale: 'Fallback after plan+topic model error.',
       plannedSteps: ['extract links', 'topic search', 'related fetch', 'compare', 'reflect', 'report'],
       extractionHints: [],
     };
-    logReasoning(`Plan fallback: ${e.message}`);
+    topicBundle = { topic: '', authors: [], mentionedTopics: [] };
+    logReasoning(`Plan+topic fallback: ${e.message}`);
   }
   if (!plan || typeof plan !== 'object') {
     plan = {
@@ -1148,30 +1183,19 @@ Output ONLY valid JSON (no markdown):
       extractionHints: [],
     };
   }
+  if (!topicBundle) topicBundle = { topic: '', authors: [], mentionedTopics: [] };
+
   inputType = plan.inputType || 'unknown';
   finishStep(
     'plan',
-    'Planning complete',
+    'Planning + topic complete',
     `Type: ${inputType} — ${(plan.plannedSteps || []).slice(0, 3).join(' → ')}${(plan.plannedSteps || []).length > 3 ? '…' : ''}`
   );
-  logReasoning(`PLAN: ${JSON.stringify(plan)}`);
+  logReasoning(`PLAN+TOPIC: ${JSON.stringify({ plan, topicBundle })}`);
   appendLiveFinding(`Classified input as “${inputType}”: ${plan.rationale || '—'}`);
 
-  addStep('links', 'Extracting links and entities…', 'thinking');
+  addStep('links', 'Extracting links (local)…', 'thinking');
   const links = extractLinks(primaryContent + '\n' + (urlInput || ''));
-  const topicTask = `From this content, propose 1 main search query (max 8 words) for finding related/competing coverage. Output JSON only: {"topic":"","authors":[],"mentionedTopics":[]}`;
-  let topicBundle;
-  try {
-    const forTopic =
-      isPlaceholderPrimaryContent(primaryContent) && urlInput
-        ? `Article body was not fetched. URL only:\n${urlInput}\nInfer topic from domain + path (slug). Output a real topic phrase — never copy bracket text or error messages.`
-        : primaryContent;
-    const topicRaw = await analyzeWithGemini(forTopic, topicTask, { temperature: 0.2, json: true, retries: 5 });
-    topicBundle = parseJsonLoose(topicRaw) || { topic: '', authors: [], mentionedTopics: [] };
-  } catch (e) {
-    topicBundle = { topic: '', authors: [], mentionedTopics: [] };
-    logReasoning(`Topic extract error: ${e.message}`);
-  }
   let searchTopic = (topicBundle.topic || '').trim();
   if (isBadSearchTopic(searchTopic)) {
     if (urlInput) searchTopic = topicGuessFromUrl(urlInput);
@@ -1215,7 +1239,7 @@ Output ONLY valid JSON (no markdown):
 
   addStep('related', 'Fetching and analyzing related sources…', 'thinking');
   const relatedBodies = [];
-  const maxRelated = 3;
+  const maxRelated = 2;
   for (let i = 0; i < Math.min(maxRelated, filteredResults.length); i++) {
     const r = filteredResults[i];
     const stepId = `related-${i}`;
@@ -1238,83 +1262,73 @@ Output ONLY valid JSON (no markdown):
     finishStep('related', `Loaded ${relatedBodies.length} related full-text sources`, '');
   }
 
-  addStep('compare', 'Cross-referencing claims across sources…', 'thinking');
+  addStep('compare', 'Cross-referencing (single batched model request)…', 'thinking');
   let comparisons = [];
-  const primaryChunk = truncate(primaryContent, 5000);
-  for (let i = 0; i < relatedBodies.length; i++) {
-    const rb = relatedBodies[i];
-    try {
-      const cmp = await compareContent(primaryChunk, rb.body || rb.snippet);
-      comparisons.push({ source: rb.url, ...cmp });
-    } catch (e) {
-      logReasoning(`Compare fail: ${e.message}`);
-    }
-  }
-  finishStep('compare', 'Cross-reference pass complete', `${comparisons.length} pairwise reviews`);
-  appendLiveFinding(`Cross-checked primary against ${comparisons.length} related lens(es) for agreements and tensions`);
+  const primaryChunk = truncate(primaryContent, 4000);
+  comparisons = await compareAllSourcesBatch(primaryChunk, relatedBodies);
+  finishStep(
+    'compare',
+    'Cross-reference pass complete',
+    `${comparisons.length} source lens(es) in one batch`
+  );
+  appendLiveFinding(`Cross-checked primary vs ${relatedBodies.length} related source(s) in one request`);
 
-  addStep('sentiment', 'Checking sentiment across sources…', 'thinking');
-  const sentTask = `For each block, rate overall sentiment toward the main subject (-1 negative, 0 neutral, 1 positive) with one evidence quote each. Output JSON only: {"primary":{"score":0,"evidence":""},"related":[{"label":"","score":0,"evidence":""}]}`;
+  addStep('sentiment', 'Sentiment + reflection (single model request)…', 'thinking');
+  const sentReflectTask = `You have PRIMARY and RELATED excerpts below.
+
+Return ONE JSON object with two parts:
+
+1) sentiment: { "primary": {"score": -1|0|1, "evidence": ""}, "related": [ {"label":"","score":-1|0|1,"evidence":""} ] } — sentiment toward the main subject.
+
+2) reflection: { "satisfied": true|false, "confidence": 0-100, "gaps": [], "nextQueries": [], "narrative": "one sentence" } — whether research is enough for a final report.
+
+Use keys exactly: sentiment, reflection.`;
+
   const sentBlob = relatedBodies
-    .map((r, j) => `RELATED_${j}: ${truncate(r.body || r.snippet, 2000)}`)
+    .map((r, j) => `RELATED_${j} (${r.url}): ${truncate(r.body || r.snippet, 1200)}`)
     .join('\n\n');
-  let sentiment;
+  let sentiment = {};
+  let reflection = {
+    satisfied: true,
+    confidence: 68,
+    gaps: [],
+    nextQueries: [],
+    narrative: 'Proceeding with available data.',
+  };
   try {
-    const sentRaw = await analyzeWithGemini(
-      `PRIMARY:\n${primaryChunk}\n\n${sentBlob}`,
-      sentTask,
-      { temperature: 0.2, json: true, retries: 5, maxIn: 12000 }
+    const srRaw = await analyzeWithGemini(
+      `PRIMARY:\n${truncate(primaryChunk, 2800)}\n\nCOMPARISONS_SUMMARY:\n${JSON.stringify(comparisons).slice(0, 2500)}\n\n${sentBlob}`,
+      sentReflectTask,
+      { temperature: 0.2, json: true, retries: 5, maxIn: 14000, maxOut: 4096 }
     );
-    sentiment = parseJsonLoose(sentRaw) || {};
+    const sr = parseJsonLoose(srRaw);
+    if (sr && typeof sr === 'object') {
+      sentiment = sr.sentiment && typeof sr.sentiment === 'object' ? sr.sentiment : {};
+      if (sr.reflection && typeof sr.reflection === 'object') {
+        reflection = {
+          satisfied: sr.reflection.satisfied !== false,
+          confidence: sr.reflection.confidence ?? 68,
+          gaps: sr.reflection.gaps || [],
+          nextQueries: sr.reflection.nextQueries || [],
+          narrative: sr.reflection.narrative || '',
+        };
+      }
+    }
   } catch (e) {
-    sentiment = {};
-    logReasoning(`Sentiment error: ${e.message}`);
+    logReasoning(`Sentiment+reflection error: ${e.message}`);
   }
-  finishStep('sentiment', 'Sentiment comparison recorded', '');
-  appendLiveFinding('Mapped sentiment posture across primary and related excerpts');
+
+  const sat = reflection.satisfied !== false;
+  let finalConfidence = reflection.confidence ?? 68;
+
+  finishStep('sentiment', 'Sentiment + reflection recorded', reflection.narrative || '');
+  logReasoning(`SENTIMENT+REFLECT: ${JSON.stringify({ sentiment, reflection })}`);
+  appendLiveFinding('Mapped sentiment and reflection in one request');
 
   let extraSnippets = [];
-  let finalConfidence = 68;
 
-  for (let reflectionLoop = 0; reflectionLoop < 2; reflectionLoop++) {
-    addStep(`reflect-${reflectionLoop}`, 'Reflecting on whether research is sufficient…', 'thinking');
-    const reflectPrompt = `You are reviewing an agent's research. Output ONLY JSON:
-{"satisfied":true|false,"confidence":0-100,"gaps":[],"nextQueries":[],"narrative":"one sentence"}
-
-Primary type: ${inputType}
-Topic: ${searchTopic}
-Related sources fetched: ${relatedBodies.length}
-Comparison summaries: ${JSON.stringify(comparisons).slice(0, 3500)}
-Sentiment: ${JSON.stringify(sentiment).slice(0, 1500)}`;
-
-    let reflection;
-    try {
-      const refRaw = await analyzeWithGemini(primaryContent, reflectPrompt, {
-        maxIn: 6000,
-        temperature: 0.25,
-        json: true,
-        retries: 5,
-      });
-      reflection = parseJsonLoose(refRaw);
-    } catch (e) {
-      reflection = { satisfied: true, confidence: 60, gaps: [], nextQueries: [], narrative: 'Proceeding with available data.' };
-    }
-    if (!reflection) reflection = { satisfied: true, confidence: 55 };
-
-    const sat = reflection.satisfied !== false;
-    finalConfidence = reflection.confidence ?? finalConfidence;
-
-    finishStep(
-      `reflect-${reflectionLoop}`,
-      sat ? 'Reflection: satisfied with coverage' : 'Reflection: detected information gaps',
-      reflection.narrative || ''
-    );
-    logReasoning(`REFLECT ${reflectionLoop}: ${JSON.stringify(reflection)}`);
-
-    const canExtend = reflectionLoop === 0 && !sat && (reflection.nextQueries || []).length > 0;
-    if (!canExtend) break;
-
-    addStep('gap', 'Detected gap in data — running additional search…', 'thinking');
+  if (!sat && (reflection.nextQueries || []).length > 0) {
+    addStep('gap', 'Detected gap — one extra search (no second reflection pass)…', 'thinking');
     const q = reflection.nextQueries[0];
     let extra;
     try {
@@ -1332,7 +1346,7 @@ Sentiment: ${JSON.stringify(sentiment).slice(0, 1500)}`;
         extraSnippets.push({ title: r.title, url: r.url, body: r.snippet || '' });
       }
     }
-    finishStep('gap', 'Additional research loop complete', `${extraSnippets.length} supplemental item(s)`);
+    finishStep('gap', 'Gap-fill fetch complete', `${extraSnippets.length} supplemental item(s)`);
     comparisons.push({
       source: 'supplemental',
       agreements: [],
