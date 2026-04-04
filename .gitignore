@@ -1,0 +1,4 @@
+# Local secrets — never commit real API keys
+.env
+*.local.html
+config.local.js

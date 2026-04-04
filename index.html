@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agentic Media Analyzer — Gemini 2.0 Flash</title>
+  <script>
+/* API keys — Gemini required; Serper optional (richer web search, https://serper.dev) */
+const GEMINI_API_KEY = 'your-key-here';
+const SERPER_API_KEY = '';
+  </script>
+  <style>
+    :root {
+      --bg: #0a0e14;
+      --panel: #121820;
+      --panel-border: #1e2836;
+      --text: #e6edf3;
+      --muted: #8b9cb3;
+      --accent: #6eb5ff;
+      --accent-dim: #3d5a80;
+      --thinking: #e3b341;
+      --done: #3ecf8e;
+      --fail: #f07178;
+      --mono: "JetBrains Mono", "Fira Code", "Cascadia Code", ui-monospace, monospace;
+      --sans: "Segoe UI", system-ui, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: var(--sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    .wrap { max-width: 1400px; margin: 0 auto; padding: 1.25rem; min-height: 100%; }
+
+    header {
+      border-bottom: 1px solid var(--panel-border);
+      padding-bottom: 1rem;
+      margin-bottom: 1rem;
+    }
+    header h1 {
+      font-size: 1.35rem;
+      font-weight: 600;
+      margin: 0 0 0.35rem 0;
+      letter-spacing: -0.02em;
+    }
+    header p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+
+    .input-row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      align-items: stretch;
+      margin-top: 1rem;
+    }
+    .input-row input[type="url"],
+    .input-row textarea {
+      flex: 1;
+      min-width: 240px;
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 0.65rem 0.85rem;
+      font-size: 0.95rem;
+    }
+    .input-row textarea { min-height: 88px; resize: vertical; font-family: var(--sans); }
+    .input-row button {
+      background: linear-gradient(135deg, #2d4a6f, var(--accent-dim));
+      color: var(--text);
+      border: 1px solid var(--accent-dim);
+      border-radius: 8px;
+      padding: 0.65rem 1.25rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+    .input-row button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 20px rgba(110, 181, 255, 0.2);
+    }
+    .input-row button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(300px, 380px) 1fr;
+      gap: 1rem;
+      align-items: start;
+    }
+    @media (max-width: 960px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .panel-head {
+      padding: 0.75rem 1rem;
+      border-bottom: 1px solid var(--panel-border);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    #agent-log {
+      font-family: var(--mono);
+      font-size: 0.78rem;
+      max-height: min(70vh, 640px);
+      overflow-y: auto;
+      padding: 0.5rem 0;
+    }
+
+    .step {
+      display: flex;
+      gap: 0.65rem;
+      padding: 0.55rem 1rem;
+      border-left: 3px solid transparent;
+      animation: stepIn 0.35s ease-out;
+    }
+    @keyframes stepIn {
+      from { opacity: 0; transform: translateX(-6px); }
+      to { opacity: 1; transform: translateX(0); }
+    }
+    .step.thinking { border-left-color: var(--thinking); background: rgba(227, 179, 65, 0.06); }
+    .step.done { border-left-color: var(--done); background: rgba(62, 207, 142, 0.05); }
+    .step.failed { border-left-color: var(--fail); background: rgba(240, 113, 120, 0.06); }
+
+    .step-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-top: 0.35rem;
+      flex-shrink: 0;
+    }
+    .step.thinking .step-dot {
+      background: var(--thinking);
+      box-shadow: 0 0 10px var(--thinking);
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.55; transform: scale(0.85); }
+    }
+    .step.done .step-dot { background: var(--done); }
+    .step.failed .step-dot { background: var(--fail); }
+
+    .step-body { flex: 1; min-width: 0; }
+    .step-msg { color: var(--text); }
+    .step-note { color: var(--muted); font-size: 0.72rem; margin-top: 0.25rem; }
+
+    #report-area {
+      min-height: 400px;
+      padding: 1rem 1.25rem 1.5rem;
+    }
+    #report-area h2 {
+      font-size: 1.05rem;
+      margin: 1.25rem 0 0.5rem;
+      color: var(--accent);
+      border-bottom: 1px solid var(--panel-border);
+      padding-bottom: 0.35rem;
+    }
+    #report-area h2:first-child { margin-top: 0; }
+    #report-area .section-body {
+      color: var(--text);
+      font-size: 0.92rem;
+    }
+    #report-area .placeholder {
+      color: var(--muted);
+      font-style: italic;
+      padding: 2rem 0;
+    }
+    #report-area ul { margin: 0.35rem 0; padding-left: 1.25rem; }
+    #report-area .evidence { font-size: 0.85rem; color: var(--muted); margin-top: 0.35rem; }
+
+    .graph-wrap {
+      margin-top: 1rem;
+      padding: 1rem;
+      background: var(--panel);
+      border: 1px solid var(--panel-border);
+      border-radius: 12px;
+    }
+    .graph-wrap h3 {
+      margin: 0 0 0.75rem;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+    .source-graph {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem 0;
+      min-height: 72px;
+    }
+    .graph-node {
+      font-family: var(--mono);
+      font-size: 0.7rem;
+      padding: 0.45rem 0.65rem;
+      border-radius: 8px;
+      border: 1px solid var(--panel-border);
+      background: rgba(110, 181, 255, 0.08);
+      max-width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      animation: nodePop 0.4s ease-out;
+    }
+    @keyframes nodePop {
+      from { opacity: 0; transform: scale(0.9); }
+      to { opacity: 1; transform: scale(1); }
+    }
+    .graph-node.root {
+      border-color: var(--accent);
+      background: rgba(110, 181, 255, 0.15);
+      font-weight: 600;
+    }
+    .graph-connector {
+      color: var(--accent-dim);
+      font-family: var(--mono);
+      font-size: 0.65rem;
+      padding: 0 0.25rem;
+      user-select: none;
+    }
+
+    details.raw-log {
+      margin-top: 1.25rem;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    details.raw-log summary {
+      padding: 0.6rem 1rem;
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--muted);
+      background: rgba(0,0,0,0.2);
+    }
+    details.raw-log pre {
+      margin: 0;
+      padding: 1rem;
+      font-family: var(--mono);
+      font-size: 0.68rem;
+      color: var(--muted);
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 280px;
+      overflow-y: auto;
+      background: #0a0e14;
+    }
+
+    .confidence-bar {
+      height: 8px;
+      border-radius: 4px;
+      background: var(--panel-border);
+      margin-top: 0.5rem;
+      overflow: hidden;
+    }
+    .confidence-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+      transition: width 0.6s ease-out;
+    }
+
+    #graph-svg {
+      width: 100%;
+      max-width: 520px;
+      height: auto;
+      display: block;
+      margin: 0 auto 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Agentic media analyzer</h1>
+      <p>Autonomous research loop powered by Gemini 2.0 Flash — plan, execute, reflect, report.</p>
+      <div class="input-row">
+        <input type="url" id="url-input" placeholder="https://… article or page URL" autocomplete="off" />
+      </div>
+      <div class="input-row" style="margin-top:0.5rem;">
+        <textarea id="text-input" placeholder="Or paste raw text / social post / transcript here (skips fetch)"></textarea>
+        <button type="button" id="run-btn">Run agent</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <div class="panel">
+        <div class="panel-head">Agent thinking</div>
+        <div id="agent-log"></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">Live report</div>
+        <div id="report-area">
+          <p class="placeholder" id="report-placeholder">Submit a URL or text. The agent will plan, research, reflect, and build this report as it works.</p>
+          <div id="report-sections" style="display:none;"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="graph-wrap">
+      <h3>Source graph</h3>
+      <svg id="graph-svg" viewBox="0 0 400 200" aria-label="Sources connected by the agent"></svg>
+      <div class="source-graph" id="source-graph">
+        <span class="graph-node root" id="graph-root">—</span>
+      </div>
+    </div>
+  </div>
+
+  <script>
+const GEMINI_MODEL = 'gemini-2.0-flash';
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+const ALLORIGINS = 'https://api.allorigins.win/get?url=';
+
+const state = {
+  reasoningLog: [],
+  sourceNodes: [],
+  stepEls: new Map(),
+};
+
+function logReasoning(line) {
+  const ts = new Date().toISOString();
+  state.reasoningLog.push(`[${ts}] ${line}`);
+}
+
+function truncate(str, max = 14000) {
+  if (!str || str.length <= max) return str;
+  return str.slice(0, max) + '\n\n[…truncated for model context…]';
+}
+
+function stripCodeFences(text) {
+  const t = text.trim();
+  const m = t.match(/^```(?:json)?\s*([\s\S]*?)```$/i);
+  return m ? m[1].trim() : t;
+}
+
+async function analyzeWithGemini(content, task, options = {}) {
+  const sys = options.systemHint || '';
+  const prompt = sys
+    ? `${sys}\n\n---\nTASK: ${task}\n\n---\nCONTENT:\n${truncate(content, options.maxIn || 14000)}`
+    : `TASK: ${task}\n\n---\nCONTENT:\n${truncate(content, options.maxIn || 14000)}`;
+
+  const body = {
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: {
+      temperature: options.temperature ?? 0.35,
+      maxOutputTokens: options.maxOut ?? 8192,
+    },
+  };
+
+  const res = await fetch(`${GEMINI_URL}?key=${encodeURIComponent(GEMINI_API_KEY)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Gemini HTTP ${res.status}: ${errText.slice(0, 200)}`);
+  }
+
+  const data = await res.json();
+  const parts = data?.candidates?.[0]?.content?.parts;
+  if (!parts?.length) {
+    const fb = data?.promptFeedback;
+    throw new Error(fb ? `Gemini blocked: ${JSON.stringify(fb)}` : 'Empty Gemini response');
+  }
+  return parts.map((p) => p.text || '').join('');
+}
+
+function extractLinks(content) {
+  if (!content) return [];
+  const re = /https?:\/\/[^\s"'<>()[\]{}]+/gi;
+  const found = content.match(re) || [];
+  const uniq = [...new Set(found.map((u) => u.replace(/[),.;:]+$/, '')))];
+  return uniq;
+}
+
+function htmlToText(html) {
+  try {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    const t = doc.body?.innerText || '';
+    return t.replace(/\n{3,}/g, '\n\n').trim();
+  } catch {
+    return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+}
+
+async function fetchContent(url, attempt = 0) {
+  const enc = encodeURIComponent(url);
+  const proxyUrl = ALLORIGINS + enc;
+  const res = await fetch(proxyUrl);
+  if (!res.ok) throw new Error(`Proxy HTTP ${res.status}`);
+  const wrap = await res.json();
+  const raw = wrap.contents;
+  if (typeof raw !== 'string') throw new Error('Unexpected proxy payload');
+  return htmlToText(raw) || raw.slice(0, 50000);
+}
+
+async function fetchContentWithRetry(url) {
+  const max = 2;
+  let lastErr;
+  for (let i = 0; i < max; i++) {
+    try {
+      return await fetchContent(url, i);
+    } catch (e) {
+      lastErr = e;
+      await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+async function searchRelated(topic) {
+  const q = (topic || '').trim().slice(0, 200);
+  if (!q) return { results: [], source: 'none' };
+
+  if (SERPER_API_KEY) {
+    try {
+      const res = await fetch('https://google.serper.dev/search', {
+        method: 'POST',
+        headers: {
+          'X-API-KEY': SERPER_API_KEY,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ q, num: 8 }),
+      });
+      if (!res.ok) throw new Error(`Serper ${res.status}`);
+      const data = await res.json();
+      const organic = data.organic || [];
+      const results = organic.map((o) => ({
+        title: o.title,
+        url: o.link,
+        snippet: o.snippet || '',
+      }));
+      return { results, source: 'serper' };
+    } catch {
+      /* fall through */
+    }
+  }
+
+  const wiki = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&format=json&origin=*`;
+  const res = await fetch(wiki);
+  if (!res.ok) throw new Error(`Wikipedia search ${res.status}`);
+  const data = await res.json();
+  const hits = data.query?.search || [];
+  const results = hits.slice(0, 8).map((h) => ({
+    title: h.title,
+    url: `https://en.wikipedia.org/wiki/${encodeURIComponent(h.title.replace(/ /g, '_'))}`,
+    snippet: h.snippet?.replace(/<[^>]+>/g, '') || '',
+  }));
+  return { results, source: 'wikipedia' };
+}
+
+async function compareContent(source1, source2) {
+  const task =
+    'Compare and contrast these two sources. Output JSON only: {"agreements":[],"disagreements":[],"uniqueClaims1":[],"uniqueClaims2":[],"toneComparison":""}';
+  const combined = `SOURCE A:\n${truncate(source1, 6000)}\n\nSOURCE B:\n${truncate(source2, 6000)}`;
+  const raw = await analyzeWithGemini(combined, task, { temperature: 0.2 });
+  let parsed;
+  try {
+    parsed = JSON.parse(stripCodeFences(raw));
+  } catch {
+    parsed = { agreements: [], disagreements: [], rawComparison: raw };
+  }
+  return parsed;
+}
+
+function addStep(id, message, status = 'thinking', note = '') {
+  const log = document.getElementById('agent-log');
+  let el = state.stepEls.get(id);
+  if (!el) {
+    el = document.createElement('div');
+    el.className = `step ${status}`;
+    el.innerHTML = '<div class="step-dot"></div><div class="step-body"><div class="step-msg"></div><div class="step-note"></div></div>';
+    log.appendChild(el);
+    state.stepEls.set(id, el);
+  }
+  el.className = `step ${status}`;
+  el.querySelector('.step-msg').textContent = message;
+  el.querySelector('.step-note').textContent = note || '';
+  log.scrollTop = log.scrollHeight;
+}
+
+function finishStep(id, message, note) {
+  addStep(id, message, 'done', note);
+}
+
+function failStep(id, message, note) {
+  addStep(id, message, 'failed', note);
+}
+
+function setGraphRoot(label) {
+  state.sourceNodes = [{ id: 'root', label, root: true }];
+  renderGraph();
+}
+
+function addGraphNode(label, url) {
+  const short = label.slice(0, 28) + (label.length > 28 ? '…' : '');
+  state.sourceNodes.push({ label: short, url, root: false });
+  renderGraph();
+}
+
+function renderGraph() {
+  const container = document.getElementById('source-graph');
+  container.innerHTML = '';
+  const nodes = state.sourceNodes;
+  nodes.forEach((node, i) => {
+    if (i > 0) {
+      const c = document.createElement('span');
+      c.className = 'graph-connector';
+      c.textContent = '──►';
+      container.appendChild(c);
+    }
+    const div = document.createElement('div');
+    div.className = 'graph-node' + (node.root ? ' root' : '');
+    if (node.root) div.id = 'graph-root';
+    const lab = node.label || '';
+    div.textContent = lab.slice(0, 40) + (lab.length > 40 ? '…' : '');
+    div.title = node.url || lab;
+    container.appendChild(div);
+  });
+  renderHubSvg();
+}
+
+function renderHubSvg() {
+  const svg = document.getElementById('graph-svg');
+  if (!svg) return;
+  const nodes = state.sourceNodes;
+  svg.innerHTML = '';
+  if (!nodes.length) return;
+
+  const w = 400;
+  const h = 200;
+  const cx = w / 2;
+  const cy = h / 2;
+  const root = nodes[0];
+  const sat = nodes.slice(1);
+  const ns = 'http://www.w3.org/2000/svg';
+  const strokeCol = '#3d5a80';
+  const accent = '#6eb5ff';
+
+  function el(name, attrs) {
+    const e = document.createElementNS(ns, name);
+    Object.entries(attrs || {}).forEach(([k, v]) => e.setAttribute(k, v));
+    return e;
+  }
+
+  sat.forEach((node, i) => {
+    const n = Math.max(sat.length, 1);
+    const R = 78;
+    const angle = (i / n) * Math.PI * 2 - Math.PI / 2;
+    const x = cx + R * Math.cos(angle);
+    const y = cy + R * Math.sin(angle);
+    const line = el('line', {
+      x1: cx,
+      y1: cy,
+      x2: x,
+      y2: y,
+      stroke: strokeCol,
+      'stroke-width': 1.5,
+      opacity: 0.85,
+    });
+    svg.appendChild(line);
+    const c = el('circle', {
+      cx: x,
+      cy: y,
+      r: 9,
+      fill: 'rgba(110,181,255,0.12)',
+      stroke: '#1e2836',
+      'stroke-width': 2,
+    });
+    svg.appendChild(c);
+    const t = el('text', {
+      x,
+      y: y + 24,
+      'text-anchor': 'middle',
+      fill: '#8b9cb3',
+      'font-size': 9,
+      'font-family': 'ui-monospace, monospace',
+    });
+    const lab = (node.label || '').slice(0, 22);
+    t.textContent = lab + ((node.label || '').length > 22 ? '…' : '');
+    svg.appendChild(t);
+  });
+
+  const rc = el('circle', {
+    cx,
+    cy,
+    r: 16,
+    fill: 'rgba(110,181,255,0.22)',
+    stroke: accent,
+    'stroke-width': 2,
+  });
+  svg.appendChild(rc);
+  const rt = el('text', {
+    x: cx,
+    y: cy + 4,
+    'text-anchor': 'middle',
+    fill: '#e6edf3',
+    'font-size': 10,
+    'font-weight': '600',
+    'font-family': 'ui-monospace, monospace',
+  });
+  const rl = (root.label || 'Primary').slice(0, 18);
+  rt.textContent = rl + ((root.label || '').length > 18 ? '…' : '');
+  svg.appendChild(rt);
+}
+
+function showReportPlaceholder(show) {
+  document.getElementById('report-placeholder').style.display = show ? 'block' : 'none';
+  document.getElementById('report-sections').style.display = show ? 'none' : 'block';
+}
+
+function appendReportSection(title, html) {
+  showReportPlaceholder(false);
+  const host = document.getElementById('report-sections');
+  const h2 = document.createElement('h2');
+  h2.textContent = title;
+  const div = document.createElement('div');
+  div.className = 'section-body';
+  div.innerHTML = html;
+  host.appendChild(h2);
+  host.appendChild(div);
+}
+
+function clearReport() {
+  document.getElementById('report-sections').innerHTML = '';
+  showReportPlaceholder(true);
+}
+
+function ensureLiveBuildSection() {
+  const host = document.getElementById('report-sections');
+  let wrap = document.getElementById('live-report-build');
+  if (!wrap) {
+    showReportPlaceholder(false);
+    wrap = document.createElement('div');
+    wrap.id = 'live-report-build';
+    wrap.innerHTML =
+      '<h2>Report in progress</h2><p class="evidence">Sections finalize after the reflection loop completes.</p><ul id="live-report-ul"></ul>';
+    host.appendChild(wrap);
+  }
+  return document.getElementById('live-report-ul');
+}
+
+function appendLiveFinding(text) {
+  const ul = ensureLiveBuildSection();
+  const li = document.createElement('li');
+  li.textContent = text;
+  ul.appendChild(li);
+}
+
+function removeLiveBuildSection() {
+  document.getElementById('live-report-build')?.remove();
+}
+
+function parseJsonLoose(text) {
+  const s = stripCodeFences(text);
+  try {
+    return JSON.parse(s);
+  } catch {
+    const start = s.indexOf('{');
+    const end = s.lastIndexOf('}');
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(s.slice(start, end + 1));
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
+}
+
+async function agentHandleToolError(toolName, err, context) {
+  logReasoning(`TOOL_FAIL ${toolName}: ${err.message}`);
+  try {
+    const msg = await analyzeWithGemini(
+      `Tool: ${toolName}\nContext: ${context}\nError: ${err.message}`,
+      'You are the agent. In plain English (no raw error codes), explain what went wrong and what you will do instead: retry, skip, or use an alternative. Output JSON only: {"userMessage":"","decision":"retry|skip|alternative","followUp":""}',
+      { maxIn: 800, temperature: 0.3 }
+    );
+    return parseJsonLoose(msg) || { userMessage: 'That step did not finish; moving on with what we already have.', decision: 'skip', followUp: '' };
+  } catch {
+    return {
+      userMessage: 'A network or service hiccup blocked that step. The agent will skip it and keep working.',
+      decision: 'skip',
+      followUp: '',
+    };
+  }
+}
+
+document.getElementById('run-btn').addEventListener('click', runAgent);
+
+async function runAgent() {
+  const urlInput = document.getElementById('url-input').value.trim();
+  const textInput = document.getElementById('text-input').value.trim();
+  const btn = document.getElementById('run-btn');
+
+  if (typeof GEMINI_API_KEY === 'undefined' || !GEMINI_API_KEY || GEMINI_API_KEY === 'your-key-here') {
+    alert('Set GEMINI_API_KEY in the <head> script at the top of this file (Google AI Studio key).');
+    return;
+  }
+
+  if (!urlInput && !textInput) {
+    alert('Enter a URL or paste content.');
+    return;
+  }
+
+  if (urlInput) {
+    try {
+      new URL(urlInput);
+    } catch {
+      alert('That URL is not valid. Include https:// or paste text in the box instead.');
+      return;
+    }
+  }
+
+  btn.disabled = true;
+  document.getElementById('agent-log').innerHTML = '';
+  state.stepEls.clear();
+  state.reasoningLog = [];
+  clearReport();
+
+  try {
+    await executeAgentPipeline(urlInput, textInput);
+  } catch (e) {
+    addStep('fatal', 'Agent stopped', 'failed', e.message || String(e));
+    logReasoning(`FATAL: ${e.message}`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function executeAgentPipeline(urlInput, textInput) {
+  let primaryContent = '';
+  let primaryLabel = 'Pasted content';
+  let inputType = 'unknown';
+
+  if (textInput) {
+    primaryContent = textInput;
+    primaryLabel = 'Pasted text';
+    setGraphRoot(primaryLabel);
+    addStep('ingest', 'Received pasted content…', 'thinking');
+    finishStep('ingest', 'Ingested pasted content', `${primaryContent.length} characters`);
+    logReasoning('Input: pasted text');
+  } else {
+    let host = urlInput;
+    try {
+      host = new URL(urlInput).hostname || urlInput;
+    } catch {
+      /* validated earlier */
+    }
+    primaryLabel = urlInput;
+    setGraphRoot(host);
+    addStep('fetch', 'Fetching original URL…', 'thinking');
+    try {
+      primaryContent = await fetchContentWithRetry(urlInput);
+      finishStep('fetch', 'Fetched original content', `${primaryContent.length} chars extracted`);
+      logReasoning(`Fetched URL OK: ${urlInput}`);
+    } catch (e) {
+      const handled = await agentHandleToolError('fetchContent', e, urlInput);
+      failStep('fetch', 'Could not fully load that page', handled.userMessage || 'The page may block proxies or require login.');
+      logReasoning(`Fetch failed: ${e.message}; decision: ${handled.decision}`);
+      if (handled.decision === 'skip') {
+        primaryContent = `[URL provided but body could not be retrieved: ${urlInput}]\nUser context: ${handled.followUp || ''}`;
+      } else {
+        try {
+          primaryContent = await fetchContentWithRetry(urlInput);
+          finishStep('fetch-retry', 'Fetched on retry', '');
+        } catch (e2) {
+          primaryContent = `[URL: ${urlInput}] — content unavailable. Proceeding with metadata-only analysis.`;
+        }
+      }
+    }
+  }
+
+  addStep('plan', 'Planning research approach…', 'thinking');
+  const planPrompt = `You are an autonomous media research agent. Given the following primary content (or description), classify the medium and plan tools.
+
+Output ONLY valid JSON (no markdown):
+{
+  "inputType": "article|video|social|image|unknown",
+  "rationale": "one sentence",
+  "plannedSteps": ["short label", "..."],
+  "extractionHints": ["what to look for in this content type"]
+}
+
+Primary snippet:
+${truncate(primaryContent, 3500)}`;
+
+  let plan;
+  try {
+    const planRaw = await analyzeWithGemini(primaryContent || urlInput || '', planPrompt, { maxIn: 4000, temperature: 0.2 });
+    plan = parseJsonLoose(planRaw);
+  } catch (e) {
+    plan = {
+      inputType: 'unknown',
+      rationale: 'Fallback plan after planning model error.',
+      plannedSteps: ['extract links', 'topic search', 'related fetch', 'compare', 'reflect', 'report'],
+      extractionHints: [],
+    };
+    logReasoning(`Plan fallback: ${e.message}`);
+  }
+  if (!plan || typeof plan !== 'object') {
+    plan = {
+      inputType: 'unknown',
+      plannedSteps: ['extract links', 'topic search', 'related fetch', 'compare', 'reflect', 'report'],
+      rationale: 'Default plan',
+      extractionHints: [],
+    };
+  }
+  inputType = plan.inputType || 'unknown';
+  finishStep(
+    'plan',
+    'Planning complete',
+    `Type: ${inputType} — ${(plan.plannedSteps || []).slice(0, 3).join(' → ')}${(plan.plannedSteps || []).length > 3 ? '…' : ''}`
+  );
+  logReasoning(`PLAN: ${JSON.stringify(plan)}`);
+  appendLiveFinding(`Classified input as “${inputType}”: ${plan.rationale || '—'}`);
+
+  addStep('links', 'Extracting links and entities…', 'thinking');
+  const links = extractLinks(primaryContent + '\n' + (urlInput || ''));
+  const topicTask = `From this content, propose 1 main search query (max 8 words) for finding related/competing coverage. Output JSON only: {"topic":"","authors":[],"mentionedTopics":[]}`;
+  let topicBundle;
+  try {
+    const topicRaw = await analyzeWithGemini(primaryContent, topicTask, { temperature: 0.2 });
+    topicBundle = parseJsonLoose(topicRaw) || { topic: '', authors: [], mentionedTopics: [] };
+  } catch (e) {
+    topicBundle = { topic: '', authors: [], mentionedTopics: [] };
+    logReasoning(`Topic extract error: ${e.message}`);
+  }
+  const searchTopic = topicBundle.topic || (primaryContent || '').split(/\s+/).slice(0, 6).join(' ') || 'news';
+  finishStep('links', `Found ${links.length} URLs; topics scoped`, `Search focus: “${searchTopic}”`);
+  logReasoning(`Links: ${links.length}, topic: ${searchTopic}`);
+  const auth = (topicBundle.authors || []).slice(0, 3).join(', ');
+  appendLiveFinding(
+    `Extracted ${links.length} links; search focus “${searchTopic}”${auth ? `; signals of authors: ${auth}` : ''}`
+  );
+
+  addStep('search', 'Searching for related / competing sources…', 'thinking');
+  let searchPack;
+  try {
+    searchPack = await searchRelated(searchTopic);
+  } catch (e) {
+    const h = await agentHandleToolError('searchRelated', e, searchTopic);
+    addStep('search', 'Search had issues', 'failed', h.userMessage);
+    searchPack = { results: [], source: 'failed' };
+  }
+  const filteredResults = (searchPack.results || []).filter((r) => {
+    if (!r.url) return false;
+    if (urlInput && r.url === urlInput) return false;
+    return true;
+  });
+  finishStep(
+    'search',
+    `Related search complete (${searchPack.source})`,
+    `${filteredResults.length} candidate sources`
+  );
+  logReasoning(`Search ${searchPack.source}: ${filteredResults.length} results`);
+  appendLiveFinding(`Discovery: ${filteredResults.length} related results via ${searchPack.source}${searchPack.source === 'failed' ? ' (degraded)' : ''}`);
+
+  addStep('related', 'Fetching and analyzing related sources…', 'thinking');
+  const relatedBodies = [];
+  const maxRelated = 3;
+  for (let i = 0; i < Math.min(maxRelated, filteredResults.length); i++) {
+    const r = filteredResults[i];
+    const stepId = `related-${i}`;
+    addStep(stepId, `Pulling: ${r.title?.slice(0, 50) || r.url}…`, 'thinking');
+    try {
+      const body = await fetchContentWithRetry(r.url);
+      relatedBodies.push({ title: r.title, url: r.url, body, snippet: r.snippet });
+      addGraphNode(r.title || r.url, r.url);
+      finishStep(stepId, `Analyzed related source ${i + 1}`, r.url);
+      logReasoning(`Related OK: ${r.url}`);
+    } catch (e) {
+      const h = await agentHandleToolError('fetchContent', e, r.url);
+      failStep(stepId, 'Skipped a related URL', h.userMessage || 'Could not load; trying next.');
+      logReasoning(`Related fail ${r.url}: ${h.decision}`);
+    }
+  }
+  if (relatedBodies.length === 0) {
+    finishStep('related', 'No extra pages loaded; using search snippets only', 'Agent will rely on snippets and primary content');
+  } else {
+    finishStep('related', `Loaded ${relatedBodies.length} related full-text sources`, '');
+  }
+
+  addStep('compare', 'Cross-referencing claims across sources…', 'thinking');
+  let comparisons = [];
+  const primaryChunk = truncate(primaryContent, 5000);
+  for (let i = 0; i < relatedBodies.length; i++) {
+    const rb = relatedBodies[i];
+    try {
+      const cmp = await compareContent(primaryChunk, rb.body || rb.snippet);
+      comparisons.push({ source: rb.url, ...cmp });
+    } catch (e) {
+      logReasoning(`Compare fail: ${e.message}`);
+    }
+  }
+  finishStep('compare', 'Cross-reference pass complete', `${comparisons.length} pairwise reviews`);
+  appendLiveFinding(`Cross-checked primary against ${comparisons.length} related lens(es) for agreements and tensions`);
+
+  addStep('sentiment', 'Checking sentiment across sources…', 'thinking');
+  const sentTask = `For each block, rate overall sentiment toward the main subject (-1 negative, 0 neutral, 1 positive) with one evidence quote each. Output JSON only: {"primary":{"score":0,"evidence":""},"related":[{"label":"","score":0,"evidence":""}]}`;
+  const sentBlob = relatedBodies
+    .map((r, j) => `RELATED_${j}: ${truncate(r.body || r.snippet, 2000)}`)
+    .join('\n\n');
+  let sentiment;
+  try {
+    const sentRaw = await analyzeWithGemini(
+      `PRIMARY:\n${primaryChunk}\n\n${sentBlob}`,
+      sentTask,
+      { temperature: 0.2 }
+    );
+    sentiment = parseJsonLoose(sentRaw) || {};
+  } catch (e) {
+    sentiment = {};
+    logReasoning(`Sentiment error: ${e.message}`);
+  }
+  finishStep('sentiment', 'Sentiment comparison recorded', '');
+  appendLiveFinding('Mapped sentiment posture across primary and related excerpts');
+
+  let extraSnippets = [];
+  let finalConfidence = 68;
+
+  for (let reflectionLoop = 0; reflectionLoop < 2; reflectionLoop++) {
+    addStep(`reflect-${reflectionLoop}`, 'Reflecting on whether research is sufficient…', 'thinking');
+    const reflectPrompt = `You are reviewing an agent's research. Output ONLY JSON:
+{"satisfied":true|false,"confidence":0-100,"gaps":[],"nextQueries":[],"narrative":"one sentence"}
+
+Primary type: ${inputType}
+Topic: ${searchTopic}
+Related sources fetched: ${relatedBodies.length}
+Comparison summaries: ${JSON.stringify(comparisons).slice(0, 3500)}
+Sentiment: ${JSON.stringify(sentiment).slice(0, 1500)}`;
+
+    let reflection;
+    try {
+      const refRaw = await analyzeWithGemini(primaryContent, reflectPrompt, { maxIn: 6000, temperature: 0.25 });
+      reflection = parseJsonLoose(refRaw);
+    } catch (e) {
+      reflection = { satisfied: true, confidence: 60, gaps: [], nextQueries: [], narrative: 'Proceeding with available data.' };
+    }
+    if (!reflection) reflection = { satisfied: true, confidence: 55 };
+
+    const sat = reflection.satisfied !== false;
+    finalConfidence = reflection.confidence ?? finalConfidence;
+
+    finishStep(
+      `reflect-${reflectionLoop}`,
+      sat ? 'Reflection: satisfied with coverage' : 'Reflection: detected information gaps',
+      reflection.narrative || ''
+    );
+    logReasoning(`REFLECT ${reflectionLoop}: ${JSON.stringify(reflection)}`);
+
+    const canExtend = reflectionLoop === 0 && !sat && (reflection.nextQueries || []).length > 0;
+    if (!canExtend) break;
+
+    addStep('gap', 'Detected gap in data — running additional search…', 'thinking');
+    const q = reflection.nextQueries[0];
+    let extra;
+    try {
+      extra = await searchRelated(q);
+    } catch (e) {
+      extra = { results: [] };
+    }
+    const ex = (extra.results || []).slice(0, 2);
+    for (const r of ex) {
+      try {
+        const body = await fetchContentWithRetry(r.url);
+        extraSnippets.push({ title: r.title, url: r.url, body: body.slice(0, 4000) });
+        addGraphNode(r.title || 'extra', r.url);
+      } catch {
+        extraSnippets.push({ title: r.title, url: r.url, body: r.snippet || '' });
+      }
+    }
+    finishStep('gap', 'Additional research loop complete', `${extraSnippets.length} supplemental item(s)`);
+    comparisons.push({
+      source: 'supplemental',
+      agreements: [],
+      disagreements: reflection.gaps || [],
+      note: 'From gap-fill search',
+    });
+  }
+
+  addStep('report', 'Compiling final report…', 'thinking');
+  appendLiveFinding('Reflection complete — synthesizing executive summary and structured assessment');
+
+  const reportPrompt = `Produce the FINAL structured report as JSON ONLY (no markdown fence):
+{
+  "executiveSummary": ["sentence1","sentence2","sentence3"],
+  "keyThemes": ["..."],
+  "sentimentAnalysis": {"summary":"","evidence":[{"source":"","detail":""}]},
+  "credibility": [{"source":"","assessment":"","signals":""}],
+  "competingPerspectives": {"summary":"","contrasts":[{"point":"","howSourcesDiffer":""}]},
+  "audienceReach": {"summary":"","reasoning":""},
+  "agentConfidence": 0-100,
+  "confidenceRationale": ""
+}
+
+Context:
+- Input type: ${inputType}
+- Primary excerpt: ${truncate(primaryContent, 4500)}
+- Authors/topics JSON: ${JSON.stringify(topicBundle)}
+- Related meta: ${JSON.stringify(relatedBodies.map((r) => ({ title: r.title, url: r.url })))}
+- Comparisons: ${JSON.stringify(comparisons).slice(0, 6000)}
+- Sentiment JSON: ${JSON.stringify(sentiment)}
+- Extra: ${JSON.stringify(extraSnippets).slice(0, 3000)}
+- Plan rationale: ${plan.rationale || ''}`;
+
+  let reportJson;
+  try {
+    const reportRaw = await analyzeWithGemini('Synthesize.', reportPrompt, { maxIn: 8000, temperature: 0.35 });
+    reportJson = parseJsonLoose(reportRaw);
+  } catch (e) {
+    reportJson = null;
+    logReasoning(`Report gen error: ${e.message}`);
+  }
+
+  finishStep('report', 'Final report ready', '');
+
+  removeLiveBuildSection();
+  renderFinalReport(reportJson, {
+    plan,
+    topicBundle,
+    sentiment,
+    comparisons,
+    finalConfidence: typeof finalConfidence === 'number' ? finalConfidence : reportJson?.agentConfidence,
+    relatedBodies,
+    extraSnippets,
+  });
+
+  const pre = document.createElement('pre');
+  pre.textContent = state.reasoningLog.join('\n');
+  const details = document.createElement('details');
+  details.className = 'raw-log';
+  details.innerHTML = '<summary>Raw agent reasoning log</summary>';
+  details.appendChild(pre);
+  document.getElementById('report-sections').appendChild(details);
+}
+
+function renderFinalReport(reportJson, ctx) {
+  const esc = (s) =>
+    String(s == null ? '' : s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+  if (!reportJson) {
+    appendReportSection(
+      'Executive summary',
+      '<p>The model could not return structured JSON; showing key facts from the run.</p><ul>' +
+        `<li>Input type: ${esc(ctx.plan?.inputType)}</li>` +
+        `<li>Focus topic: ${esc(ctx.topicBundle?.topic)}</li>` +
+        `<li>Related sources loaded: ${ctx.relatedBodies?.length || 0}</li></ul>`
+    );
+  } else {
+    const ex = reportJson.executiveSummary || [];
+    const exHtml = '<p>' + ex.map((s) => esc(s)).join(' ') + '</p>';
+    appendReportSection('Executive summary', exHtml);
+
+    const themes = reportJson.keyThemes || [];
+    appendReportSection(
+      'Key themes and topics',
+      '<ul>' + themes.map((t) => '<li>' + esc(t) + '</li>').join('') + '</ul>'
+    );
+
+    const sa = reportJson.sentimentAnalysis || {};
+    const ev = sa.evidence || [];
+    appendReportSection(
+      'Sentiment analysis',
+      '<p>' + esc(sa.summary || '') + '</p>' +
+        (ev.length
+          ? '<div class="evidence">' +
+            ev.map((e) => '<p><strong>' + esc(e.source) + ':</strong> ' + esc(e.detail) + '</p>').join('') +
+            '</div>'
+          : '')
+    );
+
+    const cred = reportJson.credibility || [];
+    appendReportSection(
+      'Source credibility',
+      '<ul>' +
+        cred
+          .map(
+            (c) =>
+              '<li><strong>' +
+              esc(c.source) +
+              '</strong> — ' +
+              esc(c.assessment) +
+              (c.signals ? '<div class="evidence">' + esc(c.signals) + '</div>' : '') +
+              '</li>'
+          )
+          .join('') +
+        '</ul>'
+    );
+
+    const cp = reportJson.competingPerspectives || {};
+    const cx = cp.contrasts || [];
+    appendReportSection(
+      'Competing perspectives',
+      '<p>' + esc(cp.summary || '') + '</p>' +
+        (cx.length
+          ? '<ul>' +
+            cx
+              .map(
+                (x) =>
+                  '<li><strong>' +
+                  esc(x.point) +
+                  '</strong><div class="evidence">' +
+                  esc(x.howSourcesDiffer) +
+                  '</div></li>'
+              )
+              .join('') +
+            '</ul>'
+          : '')
+    );
+
+    const ar = reportJson.audienceReach || {};
+    appendReportSection(
+      'Audience and reach potential',
+      '<p>' + esc(ar.summary || '') + '</p>' +
+        (ar.reasoning ? '<div class="evidence">' + esc(ar.reasoning) + '</div>' : '')
+    );
+
+    const conf = reportJson.agentConfidence ?? ctx.finalConfidence ?? 65;
+    const cr = reportJson.confidenceRationale || '';
+    appendReportSection(
+      'Agent confidence',
+      '<p>' +
+        esc(cr) +
+        '</p><div class="confidence-bar"><div class="confidence-fill" style="width:' +
+        Math.min(100, Math.max(0, conf)) +
+        '%"></div></div><p class="evidence">Score: ' +
+        esc(conf) +
+        '/100</p>'
+    );
+  }
+}
+  </script>
+</body>
+</html>
