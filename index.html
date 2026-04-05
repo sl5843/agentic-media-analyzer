@@ -189,6 +189,25 @@
     }
     .snapshot-meta dt { color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; }
     .snapshot-meta dd { margin: 0.15rem 0 0; }
+    .snapshot-skim {
+      margin-top: 1rem;
+      padding-top: 0.85rem;
+      border-top: 1px solid var(--panel-border);
+    }
+    .snapshot-skim h4 {
+      margin: 0 0 0.4rem;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    .snapshot-skim ul { margin: 0; }
+    .snapshot-detail {
+      margin-top: 0.75rem;
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }
+    .snapshot-detail p { margin: 0.35rem 0 0; }
 
     .vc-grid {
       display: flex;
@@ -214,6 +233,47 @@
       margin-bottom: 0.65rem;
     }
     .vc-card-head strong { font-size: 1rem; }
+    .thesis-digest {
+      font-size: 0.8rem;
+      line-height: 1.4;
+      color: var(--muted);
+      background: rgba(0,0,0,0.2);
+      border-radius: 8px;
+      padding: 0.55rem 0.65rem;
+      margin-bottom: 0.65rem;
+      border: 1px solid rgba(255,255,255,0.06);
+    }
+    .thesis-digest strong { color: var(--text); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    .thesis-digest dl { margin: 0.35rem 0 0; display: grid; gap: 0.25rem 0.75rem; }
+    .thesis-digest dt { color: var(--muted); display: inline; }
+    .thesis-digest dd { display: inline; margin: 0; color: var(--text); }
+    .analyst-read {
+      font-size: 0.86rem;
+      line-height: 1.45;
+      color: var(--text);
+      margin: 0.5rem 0 0.65rem;
+      padding: 0.5rem 0.6rem;
+      border-left: 3px solid var(--accent-dim);
+      background: rgba(110, 181, 255, 0.06);
+    }
+    .fit-confidence {
+      font-size: 0.72rem;
+      color: var(--muted);
+      margin: -0.25rem 0 0.5rem;
+      font-family: var(--mono);
+    }
+    .pitch-structured { margin-top: 0.35rem; }
+    .pitch-structured h4 {
+      margin: 0.85rem 0 0.35rem;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--accent);
+    }
+    .pitch-structured h4:first-child { margin-top: 0; }
+    .pitch-structured p { margin: 0 0 0.5rem; line-height: 1.5; font-size: 0.92rem; }
+    .pitch-structured ul { margin: 0.25rem 0 0.5rem; }
+
     .verdict-badge {
       font-family: var(--mono);
       font-size: 0.68rem;
@@ -589,6 +649,10 @@ async function groqCompleteRetry(
 function slimStartupForLlm(s) {
   const ts = s.traction_signals;
   const traction = Array.isArray(ts) ? ts.slice(0, 5).join('; ') : String(ts || '').slice(0, 400);
+  const fts = s.founding_team_signals;
+  const founders = Array.isArray(fts) ? fts.slice(0, 4).join('; ') : String(fts || '').slice(0, 300);
+  const oq = s.open_questions_for_investors;
+  const questions = Array.isArray(oq) ? oq.slice(0, 5).join(' | ') : String(oq || '').slice(0, 400);
   return {
     company_name: String(s.company_name || '').slice(0, 120),
     one_line_description: String(s.one_line_description || '').slice(0, 500),
@@ -598,6 +662,11 @@ function slimStartupForLlm(s) {
     key_differentiator: String(s.key_differentiator || '').slice(0, 500),
     target_customer: String(s.target_customer || '').slice(0, 400),
     traction_signals: traction.slice(0, 500),
+    founding_team_signals: founders.slice(0, 400),
+    icp_summary: String(s.icp_summary || '').slice(0, 400),
+    product_surface: String(s.product_surface || '').slice(0, 200),
+    competitive_angle: String(s.competitive_angle || '').slice(0, 450),
+    open_questions_for_investors: questions.slice(0, 500),
   };
 }
 
@@ -613,6 +682,9 @@ function slimThesisForLlm(t) {
     product_signals: String(t.product_signals || '').slice(0, 500),
     themes_or_trends: themes.slice(0, 500),
     notable_portfolio: Array.isArray(t.notable_portfolio) ? t.notable_portfolio.slice(0, 6) : [],
+    check_stage_hint: String(t.check_stage_hint || '').slice(0, 200),
+    geo_focus: String(t.geo_focus || '').slice(0, 200),
+    avoid_or_out_of_scope: String(t.avoid_or_out_of_scope || '').slice(0, 350),
   };
 }
 
@@ -747,6 +819,9 @@ Return ONE JSON object with these keys only (all strings except notable_portfoli
 - product_signals
 - themes_or_trends (one string; comma-separate themes if needed)
 - notable_portfolio (JSON array of up to 8 company name strings, or [])
+- check_stage_hint (typical check size or stage sweet spot if stated, else "unknown")
+- geo_focus (regions they emphasize, else "unknown")
+- avoid_or_out_of_scope (sectors/stages they say they avoid, else "")
 
 If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
 
@@ -756,9 +831,16 @@ If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
     const o = await groqJson(user, sys, true, 2048);
     if (o && typeof o === 'object') {
       const has =
-        [o.sector_focus, o.stage_focus, o.founder_signals, o.product_signals, o.themes_or_trends].some(
-          (x) => String(x || '').trim().length > 4
-        );
+        [
+          o.sector_focus,
+          o.stage_focus,
+          o.founder_signals,
+          o.product_signals,
+          o.themes_or_trends,
+          o.check_stage_hint,
+          o.geo_focus,
+          o.avoid_or_out_of_scope,
+        ].some((x) => String(x || '').trim().length > 4);
       if (has) return { ...o, firm_name: o.firm_name || firmName };
     }
   } catch {
@@ -938,6 +1020,7 @@ function sanitizeRankingAgainstStartup(row, startupSlim, thesisByName) {
   };
   const verdictRaw = String(row.one_sentence_verdict || '').trim();
   const verdictClean = sanitizeFreeText(verdictRaw, corpusLower);
+  const analystClean = sanitizeFreeText(String(row.analyst_read || ''), corpusLower);
   const reasons = dedupeStringsPreserveOrder(
     (Array.isArray(row.top_reasons) ? row.top_reasons : []).map((x) => scrub(x))
   );
@@ -946,6 +1029,7 @@ function sanitizeRankingAgainstStartup(row, startupSlim, thesisByName) {
     ...row,
     top_reasons: reasons,
     gaps,
+    analyst_read: analystClean,
     one_sentence_verdict:
       verdictClean || 'Potential fit — validate using only startup JSON fields and the fund thesis.',
   };
@@ -975,6 +1059,8 @@ function clampVoiceThesisVsDataStartup(row, startupSlim, thesisByName) {
   return {
     ...row,
     alignment_score: score,
+    analyst_read:
+      'Fund mandate reads voice/smart hardware; startup JSON reads as software/productivity without that wedge — overlap is likely overstated without a clear device or voice story.',
     one_sentence_verdict: 'Weak fit — fund centers on voice/smart devices; startup profile reads as data/analytics software.',
     top_reasons: [
       'Fund thesis emphasizes voice assistants, smart home, or related hardware ecosystems.',
@@ -1004,6 +1090,71 @@ function sanitizePitchParagraph(text, startupSlim, vcFirmName) {
   return kept.join(' ');
 }
 
+function thesisDigestHtml(firmName, thesisByName) {
+  const raw = thesisByName.get(firmName);
+  if (!raw || raw._thin) return '';
+  const port = Array.isArray(raw.notable_portfolio) ? raw.notable_portfolio.filter(Boolean).slice(0, 5) : [];
+  const lines = [
+    ['Sector / stage', [raw.sector_focus, raw.stage_focus].filter(Boolean).join(' · ')],
+    ['Themes', String(raw.themes_or_trends || '').trim()],
+    ['Founders', String(raw.founder_signals || '').trim()],
+    ['Product signals', String(raw.product_signals || '').trim()],
+    ['Check / stage', String(raw.check_stage_hint || '').trim()],
+    ['Geo', String(raw.geo_focus || '').trim()],
+    ['Out of scope', String(raw.avoid_or_out_of_scope || '').trim()],
+  ].filter(([, v]) => v && v !== 'unknown');
+  if (lines.length === 0 && port.length === 0) return '';
+  let inner = '<div class="thesis-digest"><strong>Thesis digest</strong> (from fund site)';
+  if (lines.length) {
+    inner += '<dl>';
+    for (const [k, v] of lines) {
+      inner += `<div><dt>${esc(k)}: </dt><dd>${esc(String(v).slice(0, 380))}</dd></div>`;
+    }
+    inner += '</dl>';
+  }
+  if (port.length)
+    inner += `<p style="margin:0.35rem 0 0;font-size:0.78rem"><strong>Portfolio cues:</strong> ${esc(port.join(', '))}</p>`;
+  inner += '</div>';
+  return inner;
+}
+
+function sanitizeStructuredPitch(obj, startupSlim, vcFirmName) {
+  const corpusLower = `${jsonCorpusLower(startupSlim)}\n${String(vcFirmName || '').toLowerCase()}`;
+  const hook = sanitizeFreeText(String(obj?.opening_hook || ''), corpusLower);
+  const bridge = sanitizeFreeText(String(obj?.thesis_bridge || ''), corpusLower);
+  const proofs = (Array.isArray(obj?.proof_points) ? obj.proof_points : [])
+    .map((s) => sanitizeFreeText(String(s || ''), corpusLower))
+    .filter(Boolean)
+    .slice(0, 3);
+  const gaps = (Array.isArray(obj?.diligence_gaps) ? obj.diligence_gaps : [])
+    .map((s) => sanitizeFreeText(String(s || ''), corpusLower))
+    .filter(Boolean)
+    .slice(0, 2);
+  return { opening_hook: hook, thesis_bridge: bridge, proof_points: proofs, diligence_gaps: gaps };
+}
+
+function structuredPitchToHtml(s) {
+  let h = '<div class="pitch-structured">';
+  if (s.opening_hook) {
+    h += `<h4>Opening</h4><p>${esc(s.opening_hook)}</p>`;
+  }
+  if (s.thesis_bridge) {
+    h += `<h4>Bridge to their thesis</h4><p>${esc(s.thesis_bridge)}</p>`;
+  }
+  if (s.proof_points.length) {
+    h += '<h4>Proof points (from your profile only)</h4><ul>';
+    for (const x of s.proof_points) h += `<li>${esc(x)}</li>`;
+    h += '</ul>';
+  }
+  if (s.diligence_gaps.length) {
+    h += '<h4>What investors may still ask</h4><ul>';
+    for (const x of s.diligence_gaps) h += `<li>${esc(x)}</li>`;
+    h += '</ul>';
+  }
+  h += '</div>';
+  return h;
+}
+
 /** Per firm: ok thesis vs fetch failed vs page loaded but thesis too thin. */
 function buildFirmDataQuality(fetchResults, thesisByName) {
   const m = new Map();
@@ -1015,9 +1166,16 @@ function buildFirmDataQuality(fetchResults, thesisByName) {
     const raw = thesisByName.get(r.firm.name);
     const hasThesis =
       raw &&
-      [raw.sector_focus, raw.stage_focus, raw.founder_signals, raw.product_signals, raw.themes_or_trends].some(
-        (x) => String(x || '').trim().length > 8
-      );
+      [
+        raw.sector_focus,
+        raw.stage_focus,
+        raw.founder_signals,
+        raw.product_signals,
+        raw.themes_or_trends,
+        raw.check_stage_hint,
+        raw.geo_focus,
+        raw.avoid_or_out_of_scope,
+      ].some((x) => String(x || '').trim().length > 8);
     m.set(r.firm.name, hasThesis ? 'ok' : 'thesis_weak');
   }
   return m;
@@ -1093,12 +1251,20 @@ function normalizeRankingRow(r) {
   const verdict =
     String(r?.one_sentence_verdict || '').trim() ||
     (score >= 60 ? 'Potential fit — validate thesis alignment.' : 'Weak fit — limited overlap on available signals.');
+  let fc = Number(r?.fit_confidence_0_to_100);
+  if (Number.isNaN(fc)) fc = null;
+  else fc = Math.min(100, Math.max(0, Math.round(fc)));
+  const analyst_read = String(r?.analyst_read || '')
+    .trim()
+    .slice(0, 520);
   return {
     firm_name,
     alignment_score: score,
     top_reasons: reasons.slice(0, 3),
     gaps: gaps.slice(0, 2),
     one_sentence_verdict: verdict,
+    analyst_read,
+    fit_confidence_0_to_100: fc,
   };
 }
 
@@ -1132,7 +1298,16 @@ async function runPipeline(startupUrl) {
     }
   })();
 
-  const analyzeIntro = `From the website excerpt, return JSON with keys: company_name, one_line_description, sector (specific), stage (pre-seed|seed|series-a|unknown), business_model, key_differentiator, target_customer, traction_signals (string or array), founding_team_signals (string or array). Use unknown or "" if missing.
+  const analyzeIntro = `From the website excerpt, return JSON with keys:
+- company_name, one_line_description, sector (specific), stage (pre-seed|seed|series-a|unknown), business_model, key_differentiator, target_customer
+- traction_signals (string or array), founding_team_signals (string or array)
+- icp_summary: one sentence on who buys / primary user (or "")
+- product_surface: how they ship (e.g. web app, mobile, API, platform) — infer from excerpt or ""
+- competitive_angle: how they position vs alternatives using ONLY cues in the excerpt (no invented competitor names)
+- open_questions_for_investors: array of 3–4 short strings — important unknowns an investor would still need to diligence (missing from page)
+- investor_skim_bullets: array of exactly 3 punchy lines an associate would paste in a pass memo; ONLY facts supported by the excerpt
+
+Use unknown or "" or [] if missing.
 
 Rules: company_name must be the company OPERATING this site (the product/vendor behind ${hostHint || 'the domain'}), not a customer or case-study subject unless the page is clearly that customer’s site. one_line_description should describe that operator’s product, not a third-party headline.
 
@@ -1145,7 +1320,7 @@ Excerpt:
       analyzeIntro + sampleVcPageText(pageText, maxChars),
       'Accurate startup facts from marketing sites. JSON only.',
       true,
-      1536
+      1792
     );
 
   try {
@@ -1172,6 +1347,41 @@ Excerpt:
     `${startup.company_name || 'Company'} · ${startup.sector || 'sector TBD'}`
   );
 
+  const skimBullets = Array.isArray(startup.investor_skim_bullets)
+    ? startup.investor_skim_bullets.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 3)
+    : [];
+  const skimHtml =
+    skimBullets.length > 0
+      ? `<div class="snapshot-skim"><h4>Investor skim</h4><ul>${skimBullets.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>`
+      : '';
+  const tractionStr = Array.isArray(startup.traction_signals)
+    ? startup.traction_signals.filter(Boolean).join('; ')
+    : String(startup.traction_signals || '').trim();
+  const foundersStr = Array.isArray(startup.founding_team_signals)
+    ? startup.founding_team_signals.filter(Boolean).join('; ')
+    : String(startup.founding_team_signals || '').trim();
+  const tractionBlock = tractionStr
+    ? `<p class="snapshot-detail"><strong>Traction signals:</strong> ${esc(tractionStr.slice(0, 600))}</p>`
+    : '';
+  const foundersBlock = foundersStr
+    ? `<p class="snapshot-detail"><strong>Team signals:</strong> ${esc(foundersStr.slice(0, 500))}</p>`
+    : '';
+  const icpBlock = startup.icp_summary
+    ? `<p class="snapshot-detail"><strong>ICP:</strong> ${esc(String(startup.icp_summary).slice(0, 500))}</p>`
+    : '';
+  const surfaceBlock = startup.product_surface
+    ? `<p class="snapshot-detail"><strong>Product surface:</strong> ${esc(String(startup.product_surface).slice(0, 300))}</p>`
+    : '';
+  const compBlock = startup.competitive_angle
+    ? `<p class="snapshot-detail"><strong>Positioning:</strong> ${esc(String(startup.competitive_angle).slice(0, 500))}</p>`
+    : '';
+  const oqList = Array.isArray(startup.open_questions_for_investors)
+    ? startup.open_questions_for_investors.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 5)
+    : [];
+  const oqBlock =
+    oqList.length > 0
+      ? `<div class="snapshot-detail"><strong>Open diligence questions</strong><ul>${oqList.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>`
+      : '';
   const snapHtml = `
     <h2>Startup snapshot</h2>
     <div class="snapshot-card">
@@ -1181,8 +1391,12 @@ Excerpt:
         <div><dt>Sector</dt><dd>${esc(startup.sector || '—')}</dd></div>
         <div><dt>Stage</dt><dd>${esc(startup.stage || '—')}</dd></div>
         <div><dt>Business model</dt><dd>${esc(startup.business_model || '—')}</dd></div>
+        <div><dt>Target customer</dt><dd>${esc(startup.target_customer || '—')}</dd></div>
       </dl>
       <p style="margin-top:0.75rem"><strong>Differentiator:</strong> ${esc(startup.key_differentiator || '—')}</p>
+      ${icpBlock}${surfaceBlock}${compBlock}${tractionBlock}${foundersBlock}
+      ${skimHtml}
+      ${oqBlock}
     </div>`;
   appendSection(snapHtml);
 
@@ -1288,9 +1502,16 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     const data = await extractVcThesis(r.text, r.firm.name);
     const usable =
       data &&
-      [data.sector_focus, data.stage_focus, data.founder_signals, data.product_signals, data.themes_or_trends].some(
-        (x) => String(x || '').trim().length > 4
-      );
+      [
+        data.sector_focus,
+        data.stage_focus,
+        data.founder_signals,
+        data.product_signals,
+        data.themes_or_trends,
+        data.check_stage_hint,
+        data.geo_focus,
+        data.avoid_or_out_of_scope,
+      ].some((x) => String(x || '').trim().length > 4);
     thesisList.push({ firm: r.firm, thesis: data, ok: !!usable });
   }
   finishStep(
@@ -1313,6 +1534,9 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
         product_signals: '',
         themes_or_trends: '',
         notable_portfolio: [],
+        check_stage_hint: '',
+        geo_focus: '',
+        avoid_or_out_of_scope: '',
         _firm: r.firm,
         _thin: true,
       });
@@ -1334,8 +1558,8 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
 
 ${JSON.stringify(scorePack).slice(0, 12000)}
 
-Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"top_reasons":["","",""],"gaps":["",""],"one_sentence_verdict":""}]}
-Rules: exactly one ranking per VC above in the same order; each top_reasons must have 3 non-empty strings; each gaps must have 2 non-empty strings; verdict must start with Strong fit, Potential fit, or Weak fit; cite thesis language.
+Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"analyst_read":"","fit_confidence_0_to_100":70,"top_reasons":["","",""],"gaps":["",""],"one_sentence_verdict":""}]}
+Rules: exactly one ranking per VC above in the same order; analyst_read = exactly 2 sentences synthesizing fit and key caveats (no invented metrics); fit_confidence_0_to_100 = how trustworthy this score is given sparse homepage data (integer 0-100); each top_reasons must have 3 non-empty strings; each gaps must have 2 non-empty strings; verdict must start with Strong fit, Potential fit, or Weak fit; cite thesis language.
 
 CRITICAL — no hallucinations: In top_reasons and gaps, never mention revenue, ARR, funding rounds, customer or partner names, user counts, or geographies unless that exact fact appears in the startup object above. If startup.stage is "unknown", do not claim stage alignment with the fund.
 
@@ -1353,7 +1577,7 @@ If the fund thesis centers on a narrow vertical (e.g. voice assistants, smart ho
     try {
       const perVc = await mapPool(firms, 2, async (f) => {
         const t = slimThesisForLlm(thesisByName.get(f.name) || {});
-        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score (0-100), top_reasons (3 non-empty strings), gaps (2 non-empty strings), one_sentence_verdict. firm_name must be exactly ${JSON.stringify(f.name)}.
+        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score (0-100), analyst_read (2 sentences: fit + caveats, no invented metrics), fit_confidence_0_to_100 (integer 0-100), top_reasons (3 non-empty strings), gaps (2 non-empty strings), one_sentence_verdict. firm_name must be exactly ${JSON.stringify(f.name)}.
 
 Never invent revenue, customers, or metrics. Only cite startup facts present in the JSON. If startup.stage is "unknown", do not claim stage fit. If the fund thesis is narrowly vertical (voice/smart home, crypto, etc.) and the startup JSON does not mention that vertical, cap alignment_score at 35.`;
         try {
@@ -1367,6 +1591,9 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
         return {
           firm_name: f.name,
           alignment_score: 35,
+          analyst_read:
+            'Match is directional based on thin homepage thesis text. Validate stage, sector, and check size on the fund’s site before outreach.',
+          fit_confidence_0_to_100: 42,
           top_reasons: [
             'Limited thesis text from the fund site — directional match only.',
             `Sector overlap: ${startupSlim.sector || 'unknown'} vs fund focus.`,
@@ -1438,6 +1665,13 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
           <span class="score-num">${esc(scoreDisplay)}</span>
           <div class="score-bar-wrap"><div class="score-fill" data-target="${barTarget}"></div></div>
         </div>
+        ${
+          !r.unscorable && r.fit_confidence_0_to_100 != null
+            ? `<p class="fit-confidence">Score confidence (sparse-data): ${esc(String(r.fit_confidence_0_to_100))}/100</p>`
+            : ''
+        }
+        ${r.analyst_read && !r.unscorable ? `<div class="analyst-read">${esc(r.analyst_read)}</div>` : ''}
+        ${thesisDigestHtml(r.firm_name, thesisByName)}
         <p><strong>Why it fits</strong></p>
         <ul>${reasons.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
         <p><strong>Gaps</strong></p>
@@ -1455,36 +1689,51 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
   const topThesis = topFirm ? thesisByName.get(topFirm.firm_name) : null;
 
   addStep('s7', 'Step 7 — Pitch reframe (top VC)', 'thinking', topFirm ? topFirm.firm_name : '—');
-  let pitchParagraph = '';
+  let pitchBodyHtml = '';
   if (topFirm && topThesis) {
     const thesisPitchPack = slimThesisForLlm(topThesis);
+    const pitchJsonUser = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis:\n${JSON.stringify(thesisPitchPack)}\n\nReturn JSON only with keys: opening_hook (string, 1–2 sentences), thesis_bridge (string, 2–4 sentences), proof_points (array of exactly 3 non-empty strings; each line must cite ONLY facts from Startup JSON), diligence_gaps (array of exactly 2 non-empty strings: what is missing from the excerpt that investors will still ask).\nRules: no revenue, customer names, funding rounds, or geographies unless they appear in the Startup JSON strings above.`;
     try {
-      const pitchRaw = await groqCompleteRetry(
-        `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis (compact):\n${JSON.stringify(thesisPitchPack)}\n\nWrite ONE paragraph only.`,
-        'You are a startup pitch coach. Use ONLY facts present in the Startup JSON above. Do not invent revenue figures, customer names, funding, or geographies. Based on this VC thesis and startup facts, write one paragraph on how to angle the pitch; reference the VC’s stated language. No bullet points.',
-        false,
-        4,
-        768
-      );
-      pitchParagraph = sanitizePitchParagraph(pitchRaw.trim(), startupSlim, topFirm.firm_name);
+      const po = await groqJson(pitchJsonUser, 'JSON only.', true, 1400);
+      const cleaned = sanitizeStructuredPitch(po, startupSlim, topFirm.firm_name);
+      const structuredHtml = structuredPitchToHtml(cleaned);
+      if (structuredHtml.replace(/<[^>]+>/g, '').trim().length > 35) {
+        pitchBodyHtml = structuredHtml;
+      }
     } catch {
+      /* fallback below */
+    }
+    if (!pitchBodyHtml) {
       try {
-        const pitchRaw2 = await groqCompleteRetry(
-          `Startup: ${startupSlim.company_name} — ${startupSlim.one_line_description}. Sector: ${startupSlim.sector}. Differentiator: ${startupSlim.key_differentiator}.\n\nInvestor: ${topFirm.firm_name}. Known thesis summary: ${JSON.stringify(thesisPitchPack).slice(0, 1200)}.\n\nOne paragraph: how should the founder angle the pitch for this firm? Do not invent metrics or customers not listed above.`,
-          'One short paragraph, no bullets. Facts only from the startup line above.',
+        const pitchRaw = await groqCompleteRetry(
+          `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis (compact):\n${JSON.stringify(thesisPitchPack)}\n\nWrite ONE paragraph only.`,
+          'You are a startup pitch coach. Use ONLY facts present in the Startup JSON above. Do not invent revenue figures, customer names, funding, or geographies. Based on this VC thesis and startup facts, write one paragraph on how to angle the pitch; reference the VC’s stated language. No bullet points.',
           false,
-          3,
-          640
+          4,
+          768
         );
-        pitchParagraph = sanitizePitchParagraph(pitchRaw2.trim(), startupSlim, topFirm.firm_name);
+        pitchBodyHtml = `<p>${esc(sanitizePitchParagraph(pitchRaw.trim(), startupSlim, topFirm.firm_name))}</p>`;
       } catch {
-        pitchParagraph =
-          'Pitch reframe could not be generated (often rate limits). Wait a minute and re-run, or shorten the day’s Groq usage.';
+        try {
+          const pitchRaw2 = await groqCompleteRetry(
+            `Startup: ${startupSlim.company_name} — ${startupSlim.one_line_description}. Sector: ${startupSlim.sector}. Differentiator: ${startupSlim.key_differentiator}.\n\nInvestor: ${topFirm.firm_name}. Known thesis summary: ${JSON.stringify(thesisPitchPack).slice(0, 1200)}.\n\nOne paragraph: how should the founder angle the pitch for this firm? Do not invent metrics or customers not listed above.`,
+            'One short paragraph, no bullets. Facts only from the startup line above.',
+            false,
+            3,
+            640
+          );
+          pitchBodyHtml = `<p>${esc(sanitizePitchParagraph(pitchRaw2.trim(), startupSlim, topFirm.firm_name))}</p>`;
+        } catch {
+          pitchBodyHtml = `<p>${esc(
+            'Pitch reframe could not be generated (often rate limits). Wait a minute and re-run, or shorten the day’s Groq usage.'
+          )}</p>`;
+        }
       }
     }
   } else if (!topFirm) {
-    pitchParagraph =
-      'No fund had enough thesis text to tailor a pitch. Improve VC site fetch success in Step 4, or pick an investor and paste their thesis manually.';
+    pitchBodyHtml = `<p>${esc(
+      'No fund had enough thesis text to tailor a pitch. Improve VC site fetch success in Step 4, or pick an investor and paste their thesis manually.'
+    )}</p>`;
   }
   finishStep('s7', 'Step 7 — Pitch reframe', 'Done');
 
@@ -1492,7 +1741,7 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
   const vcName = topFirm ? topFirm.firm_name : 'the lead investor';
   appendSection(
     `<h2>How to pitch ${esc(company)} to ${esc(vcName)}</h2>
-     <div class="pitch-box">${esc(pitchParagraph)}</div>`
+     <div class="pitch-box">${pitchBodyHtml}</div>`
   );
 
   addStep('s8', 'Step 8 — Reflect', 'thinking', 'Uncertainty check…');
