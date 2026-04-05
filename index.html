@@ -1311,7 +1311,12 @@ async function runPipeline(startupUrl) {
   })();
 
   const analyzeIntro = `From the website excerpt, return JSON with keys:
-- company_name, one_line_description, sector (specific), stage (pre-seed|seed|series-a|unknown), business_model, key_differentiator, target_customer
+- company_name, one_line_description, sector (specific), stage — MUST be one of: pre-seed | seed | series-a | growth | public | unknown
+  • Use pre-seed, seed, or series-a ONLY if the excerpt explicitly names that funding stage or round (e.g. "Series A", "seed funding", "pre-seed"). Never infer these from user counts, enterprise logos, revenue adjectives, or general "scaling" language alone.
+  • Use growth if the excerpt describes a large, mature private product company with broad adoption but does not name a specific round on this page (typical big SaaS homepages).
+  • Use public only if the excerpt clearly indicates a publicly traded company.
+  • Use unknown if you cannot place the company confidently from the excerpt.
+- business_model, key_differentiator, target_customer
 - traction_signals (string or array), founding_team_signals (string or array)
 - icp_summary: one sentence on who buys / primary user (or "")
 - product_surface: how they ship (e.g. web app, mobile, API, platform) — infer from excerpt or ""
@@ -1413,8 +1418,14 @@ Excerpt:
   appendSection(snapHtml);
 
   const sector = (startup.sector || 'technology').trim();
-  const stage = (startup.stage || 'seed').replace(/-/g, ' ');
-  const searchQ = `top VC firms investing in ${sector} ${stage} startups 2025 thesis`;
+  const stageRaw = String(startup.stage || 'unknown')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, ' ');
+  const searchQ =
+    stageRaw && stageRaw !== 'unknown'
+      ? `top VC firms investing in ${sector} ${stageRaw} startups 2025 thesis`
+      : `top VC firms investing in ${sector} startups 2025 thesis`;
 
   addStep('s3', 'Step 3 — Discover VCs', 'thinking', searchQ.slice(0, 80) + '…');
   let organic = [];
