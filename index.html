@@ -907,20 +907,45 @@ function sanitizeFreeText(text, corpusLower) {
   return '';
 }
 
-const GENERIC_REASON =
-  'Refer only to facts in the extracted startup profile — do not invent revenue, customers, or metrics.';
+/** When the model cites names/numbers not in the startup JSON, replace line-by-line; rotate to avoid duplicate bullets. */
+const SANITIZER_FALLBACKS = [
+  'Treat thesis overlap as directional only — do not infer customers, revenue, or deals not in the startup JSON.',
+  'Stay within the extracted startup fields for facts; use the fund’s portfolio page to validate fit.',
+  'Match is based on sparse homepage signals; confirm stage, check size, and mandate on the fund’s site.',
+];
+
+function dedupeStringsPreserveOrder(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const x of arr) {
+    const k = String(x || '').trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
+}
 
 function sanitizeRankingAgainstStartup(row, startupSlim, thesisByName) {
   const t = thesisByName.get(row.firm_name) || {};
   const thesisSlim = slimThesisForLlm(t);
   const corpusLower = `${jsonCorpusLower(startupSlim)}\n${jsonCorpusLower(thesisSlim)}\n${String(row.firm_name || '').toLowerCase()}`;
-  const scrub = (s) => sanitizeFreeText(String(s || ''), corpusLower) || GENERIC_REASON;
+  let fi = 0;
+  const scrub = (s) => {
+    const x = sanitizeFreeText(String(s || ''), corpusLower);
+    if (x) return x;
+    return SANITIZER_FALLBACKS[fi++ % SANITIZER_FALLBACKS.length];
+  };
   const verdictRaw = String(row.one_sentence_verdict || '').trim();
   const verdictClean = sanitizeFreeText(verdictRaw, corpusLower);
+  const reasons = dedupeStringsPreserveOrder(
+    (Array.isArray(row.top_reasons) ? row.top_reasons : []).map((x) => scrub(x))
+  );
+  const gaps = dedupeStringsPreserveOrder((Array.isArray(row.gaps) ? row.gaps : []).map((x) => scrub(x)));
   return {
     ...row,
-    top_reasons: (Array.isArray(row.top_reasons) ? row.top_reasons : []).map((x) => scrub(x)),
-    gaps: (Array.isArray(row.gaps) ? row.gaps : []).map((x) => scrub(x)),
+    top_reasons: reasons,
+    gaps,
     one_sentence_verdict:
       verdictClean || 'Potential fit — validate using only startup JSON fields and the fund thesis.',
   };
