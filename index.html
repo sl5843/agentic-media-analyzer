@@ -344,6 +344,7 @@ const API_GEMINI = '/api/gemini';
 const API_GROQ = '/api/groq';
 const API_HEALTH = '/api/health';
 const API_SERPER = '/api/serper';
+const API_SERPAPI = '/api/serpapi';
 
 const ALLORIGINS_GET = 'https://api.allorigins.win/get?url=';
 
@@ -1281,6 +1282,244 @@ Return ONE JSON with all keys: inputType, rationale, plannedSteps, extractionHin
     `Extracted ${links.length} links; search focus “${searchTopic}”${auth ? `; signals of authors: ${auth}` : ''}`
   );
 
+  const vcYear = new Date().getFullYear();
+  const vcSearchQuery = `top VC firms investing in ${searchTopic} ${vcYear} thesis`;
+  let vcFirms = [];
+  let vcAlignment = null;
+  let vcReflectMeta = { hasGap: false, rationale: '', suggestedSearchQuery: '', extraDigest: '' };
+
+  async function serpApiSearch(q) {
+    const res = await fetch(API_SERPAPI, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ q: (q || '').slice(0, 400) }),
+    });
+    if (!res.ok) return { configured: false, organic_results: [], source: 'error' };
+    return res.json();
+  }
+
+  function normalizeFirmWebsite(u) {
+    let s = String(u || '').trim();
+    if (!s) return '';
+    if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+    try {
+      const p = new URL(s);
+      return p.origin + '/';
+    } catch {
+      return s;
+    }
+  }
+
+  addStep('vc-discover', 'DISCOVER: VC firms (SerpAPI)…', 'thinking');
+  try {
+    const serpData = await serpApiSearch(vcSearchQuery);
+    if (!serpData.configured) {
+      finishStep('vc-discover', 'SerpAPI not configured', 'Set SERPAPI_API_KEY on Vercel to enable VC discovery');
+      logReasoning('VC discover skipped: SERPAPI_API_KEY missing');
+    } else if (serpData.serpapi_error) {
+      finishStep('vc-discover', 'SerpAPI error', String(serpData.serpapi_error).slice(0, 120));
+      logReasoning(`VC SerpAPI: ${serpData.serpapi_error}`);
+    } else {
+      const organic = Array.isArray(serpData.organic_results) ? serpData.organic_results : [];
+      const serpPack = JSON.stringify(
+        organic.slice(0, 10).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
+      ).slice(0, 12000);
+      const pickFirmsTask = `From these Google search results, pick up to 3 distinct venture capital firms or VC funds investing in the space implied by the query (not portfolio companies, not media sites unless clearly a fund). For each: canonical firm name and best official website URL (https). Prefer domains owned by the fund.
+Return JSON only: {"firms":[{"name":"","website":""}]}
+Max 3 firms; fewer if results are thin.`;
+      try {
+        const pickRaw = await analyzeWithGemini(serpPack, pickFirmsTask, {
+          temperature: 0.15,
+          json: true,
+          retries: 4,
+          maxIn: 14000,
+          maxOut: 2048,
+        });
+        const picked = parseJsonLoose(pickRaw);
+        const arr = Array.isArray(picked?.firms) ? picked.firms : [];
+        const seen = new Set();
+        for (const f of arr) {
+          const name = String(f?.name || '').trim();
+          let website = normalizeFirmWebsite(f?.website);
+          if (!name || !website) continue;
+          const host = (() => {
+            try {
+              return new URL(website).hostname.replace(/^www\./, '');
+            } catch {
+              return website;
+            }
+          })();
+          if (seen.has(host)) continue;
+          seen.add(host);
+          vcFirms.push({ name, website });
+          if (vcFirms.length >= 3) break;
+        }
+      } catch (e) {
+        logReasoning(`VC firm pick LLM error: ${e.message}`);
+      }
+      finishStep(
+        'vc-discover',
+        vcFirms.length ? `Identified ${vcFirms.length} VC firm(s)` : 'No VC firms extracted',
+        vcFirms.map((f) => f.name).join(' · ') || vcSearchQuery
+      );
+      logReasoning(`VC DISCOVER query="${vcSearchQuery}" firms=${JSON.stringify(vcFirms)}`);
+      if (vcFirms.length) {
+        appendLiveFinding(`VC discovery: ${vcFirms.length} firm(s) — ${vcFirms.map((f) => f.name).join(', ')}`);
+      }
+    }
+  } catch (e) {
+    finishStep('vc-discover', 'VC discovery failed', e.message || 'error');
+    logReasoning(`VC discover: ${e.message}`);
+  }
+
+  for (let fi = 0; fi < vcFirms.length; fi++) {
+    const firm = vcFirms[fi];
+    const stepId = `vc-research-${fi}`;
+    addStep(stepId, `RESEARCH: ${firm.name} (site + thesis)…`, 'thinking');
+    let pageText = '';
+    try {
+      pageText = await fetchContentWithRetry(firm.website);
+    } catch (e) {
+      logReasoning(`VC fetch ${firm.website}: ${e.message}`);
+    }
+    const thesisTask = `Extract this VC firm's core investment thesis, key focus areas, and what kinds of companies they look for. Return as structured JSON with keys: coreThesis (string), keyFocusAreas (array of strings), companyProfile (string, what they seek in founders/market/stage).`;
+    let thesisObj = null;
+    try {
+      const thesisRaw = await analyzeWithGemini(truncate(pageText || firm.website, 10000), thesisTask, {
+        temperature: 0.2,
+        json: true,
+        retries: 4,
+        maxIn: 12000,
+        maxOut: 3072,
+      });
+      thesisObj = parseJsonLoose(thesisRaw);
+    } catch (e) {
+      logReasoning(`VC thesis ${firm.name}: ${e.message}`);
+    }
+    firm.thesis =
+      thesisObj && typeof thesisObj === 'object'
+        ? {
+            coreThesis: String(thesisObj.coreThesis || ''),
+            keyFocusAreas: Array.isArray(thesisObj.keyFocusAreas) ? thesisObj.keyFocusAreas : [],
+            companyProfile: String(thesisObj.companyProfile || ''),
+          }
+        : { coreThesis: '', keyFocusAreas: [], companyProfile: '' };
+    finishStep(
+      stepId,
+      `Thesis extracted: ${firm.name}`,
+      (firm.thesis.coreThesis || '').slice(0, 100) || 'Limited text from site'
+    );
+    appendLiveFinding(`VC thesis stored: ${firm.name}`);
+  }
+
+  if (vcFirms.length) {
+    addStep('vc-score', 'SCORE: alignment vs each VC thesis…', 'thinking');
+    const scorePack = {
+      articleExcerpt: truncate(primaryContent, 6000),
+      firms: vcFirms.map((f) => ({
+        name: f.name,
+        website: f.website,
+        thesis: f.thesis,
+      })),
+    };
+    const scoreTask = `You are a startup advisor. Score how well the ARTICLE (excerpt) aligns with each VC firm's investment thesis on a scale of 1-100.
+For each firm provide:
+- alignmentScore (1-100)
+- topReasons (exactly 3 strings: strongest alignment points)
+- gaps (exactly 2 strings: mismatches or risks for this fund)
+- pitchAngle (one sentence pitch angle tailored to this specific firm)
+Be specific; reference actual thesis language from the JSON.
+
+Return JSON only: {"scores":[{"firmName":"","website":"","alignmentScore":0,"topReasons":["","",""],"gaps":["",""],"pitchAngle":""}]}
+Use the same firm order as input. firmName must match.`;
+    try {
+      const scoreRaw = await analyzeWithGemini(JSON.stringify(scorePack), scoreTask, {
+        temperature: 0.25,
+        json: true,
+        retries: 4,
+        maxIn: 16000,
+        maxOut: 4096,
+      });
+      const scored = parseJsonLoose(scoreRaw);
+      vcAlignment = Array.isArray(scored?.scores) ? scored.scores : null;
+    } catch (e) {
+      logReasoning(`VC score error: ${e.message}`);
+    }
+    finishStep(
+      'vc-score',
+      vcAlignment ? 'Alignment scores computed' : 'Scoring incomplete',
+      vcAlignment ? `${vcAlignment.length} firm(s)` : '—'
+    );
+    if (vcAlignment) {
+      appendLiveFinding(
+        `VC alignment: ${vcAlignment.map((s) => `${s.firmName || '?'} ${s.alignmentScore ?? '—'}/100`).join('; ')}`
+      );
+    }
+
+    addStep('vc-reflect', 'REFLECT: review VC analysis + optional search…', 'thinking');
+    const reflectTask = `Review your own VC alignment analysis (scores, reasons, gaps) against the original article excerpt. Are there gaps in your research? Did you miss any important signals in the original content? If yes, what ONE additional search query would improve your confidence?
+Return JSON only: {"hasGap":true|false,"rationale":"","suggestedSearchQuery":""}
+If hasGap is false, suggestedSearchQuery must be "".`;
+    const reflectBlob = JSON.stringify({
+      articleExcerpt: truncate(primaryContent, 3500),
+      alignment: vcAlignment,
+    }).slice(0, 14000);
+    try {
+      const reflRaw = await analyzeWithGemini(reflectBlob, reflectTask, {
+        temperature: 0.2,
+        json: true,
+        retries: 3,
+        maxIn: 16000,
+        maxOut: 2048,
+      });
+      const refl = parseJsonLoose(reflRaw);
+      if (refl && typeof refl === 'object') {
+        vcReflectMeta = {
+          hasGap: refl.hasGap === true,
+          rationale: String(refl.rationale || ''),
+          suggestedSearchQuery: String(refl.suggestedSearchQuery || '').trim(),
+          extraDigest: '',
+        };
+      }
+    } catch (e) {
+      logReasoning(`VC reflect error: ${e.message}`);
+    }
+
+    if (vcReflectMeta.hasGap && vcReflectMeta.suggestedSearchQuery) {
+      addStep('vc-gap-search', 'Follow-up search from reflection…', 'thinking');
+      try {
+        const serp2 = await serpApiSearch(vcReflectMeta.suggestedSearchQuery);
+        const org2 = Array.isArray(serp2.organic_results) ? serp2.organic_results : [];
+        const pack2 = JSON.stringify(
+          org2.slice(0, 8).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
+        ).slice(0, 10000);
+        const digestTask = `Summarize these search snippets for an investor-alignment memo. JSON only: {"bullets":["","",""]} max 3 bullets; be concrete.`;
+        const digRaw = await analyzeWithGemini(pack2, digestTask, {
+          temperature: 0.2,
+          json: true,
+          retries: 3,
+          maxIn: 12000,
+          maxOut: 1024,
+        });
+        const dig = parseJsonLoose(digRaw);
+        const bullets = Array.isArray(dig?.bullets) ? dig.bullets : [];
+        vcReflectMeta.extraDigest = bullets.map((b) => String(b)).filter(Boolean).join('\n');
+        finishStep('vc-gap-search', 'Reflection follow-up incorporated', vcReflectMeta.suggestedSearchQuery.slice(0, 80));
+      } catch (e) {
+        finishStep('vc-gap-search', 'Follow-up search failed', e.message || 'error');
+        logReasoning(`VC gap search: ${e.message}`);
+      }
+    }
+    finishStep(
+      'vc-reflect',
+      vcReflectMeta.hasGap && vcReflectMeta.suggestedSearchQuery
+        ? 'Reflection complete (with follow-up search)'
+        : 'Reflection complete',
+      (vcReflectMeta.rationale || '').slice(0, 140) || '—'
+    );
+    logReasoning(`VC REFLECT: ${JSON.stringify(vcReflectMeta)}`);
+  }
+
   addStep('search', 'Searching for related / competing sources…', 'thinking');
   let searchPack;
   try {
@@ -1424,6 +1663,23 @@ Use keys exactly: sentiment, reflection.`;
   addStep('report', 'Compiling final report…', 'thinking');
   appendLiveFinding('Reflection complete — synthesizing executive summary and structured assessment');
 
+  const vcContextBlock =
+    vcFirms.length === 0
+      ? 'VC module: not run (SerpAPI key missing, API error, or no firms extracted).'
+      : [
+          `VC discovery query: ${vcSearchQuery}`,
+          `VC firms + theses: ${JSON.stringify(
+            vcFirms.map((f) => ({ name: f.name, website: f.website, thesis: f.thesis }))
+          ).slice(0, 8000)}`,
+          `VC alignment (prior scoring pass): ${JSON.stringify(vcAlignment || []).slice(0, 6000)}`,
+          `VC reflection: ${JSON.stringify({
+            hasGap: vcReflectMeta.hasGap,
+            rationale: vcReflectMeta.rationale,
+            suggestedSearchQuery: vcReflectMeta.suggestedSearchQuery,
+            supplementalBullets: vcReflectMeta.extraDigest,
+          }).slice(0, 4000)}`,
+        ].join('\n');
+
   const reportPrompt = `Produce the FINAL structured report as JSON ONLY (no markdown fence):
 {
   "executiveSummary": ["sentence1","sentence2","sentence3"],
@@ -1432,9 +1688,14 @@ Use keys exactly: sentiment, reflection.`;
   "credibility": [{"source":"","assessment":"","signals":""}],
   "competingPerspectives": {"summary":"","contrasts":[{"point":"","howSourcesDiffer":""}]},
   "audienceReach": {"summary":"","reasoning":""},
+  "vcDiscovery": {"query":"","firms":[{"name":"","website":""}]},
+  "vcAlignmentScores": [{"firmName":"","website":"","alignmentScore":0,"topReasons":["","",""],"gaps":["",""],"pitchAngle":""}],
+  "vcReflect": {"rationale":"","followUpQuery":"","supplementalNotes":""},
   "agentConfidence": 0-100,
   "confidenceRationale": ""
 }
+
+For vcDiscovery / vcAlignmentScores / vcReflect: if no VC research ran, use query "" and empty arrays plus empty strings. Otherwise echo the VC context faithfully (you may tighten wording but keep scores and firm names).
 
 Context:
 - Input type: ${inputType}
@@ -1444,7 +1705,10 @@ Context:
 - Comparisons: ${JSON.stringify(comparisons).slice(0, 6000)}
 - Sentiment JSON: ${JSON.stringify(sentiment)}
 - Extra: ${JSON.stringify(extraSnippets).slice(0, 3000)}
-- Plan rationale: ${plan.rationale || ''}`;
+- Plan rationale: ${plan.rationale || ''}
+
+--- VC context (agentic steps 3–6) ---
+${vcContextBlock}`;
 
   let reportJson;
   try {
@@ -1474,6 +1738,12 @@ Context:
     extraSnippets,
     searchTopic,
     quotaError: state.lastQuotaError,
+    vc: {
+      query: vcSearchQuery,
+      firms: vcFirms,
+      alignment: vcAlignment,
+      reflect: vcReflectMeta,
+    },
   });
 
   const pre = document.createElement('pre');
@@ -1524,15 +1794,32 @@ function renderFinalReport(reportJson, ctx) {
       ? 'The LLM could not complete the final JSON report, likely due to quota limits above.'
       : 'The model could not return structured JSON; showing key facts from the run.';
     const topicShow = ctx.topicBundle?.topic || ctx.searchTopic || '—';
-    appendReportSection(
-      'Executive summary',
+    let fallbackEx =
       '<p>' +
-        esc(why) +
-        '</p><ul>' +
-        `<li>Input type: ${esc(ctx.plan?.inputType)}</li>` +
-        `<li>Focus topic: ${esc(topicShow)}</li>` +
-        `<li>Related sources loaded: ${ctx.relatedBodies?.length || 0}</li></ul>`
-    );
+      esc(why) +
+      '</p><ul>' +
+      `<li>Input type: ${esc(ctx.plan?.inputType)}</li>` +
+      `<li>Focus topic: ${esc(topicShow)}</li>` +
+      `<li>Related sources loaded: ${ctx.relatedBodies?.length || 0}</li></ul>`;
+    const fVc = ctx.vc?.alignment;
+    if (Array.isArray(fVc) && fVc.length) {
+      fallbackEx +=
+        '<p><strong>VC alignment (from run, report JSON missing)</strong></p><ul>' +
+        fVc
+          .map(
+            (s) =>
+              '<li><strong>' +
+              esc(s.firmName) +
+              '</strong>: ' +
+              esc(s.alignmentScore) +
+              '/100 — ' +
+              esc((s.pitchAngle || '').slice(0, 200)) +
+              '</li>'
+          )
+          .join('') +
+        '</ul>';
+    }
+    appendReportSection('Executive summary', fallbackEx);
   } else {
     const ex = reportJson.executiveSummary || [];
     const exHtml = '<p>' + ex.map((s) => esc(s)).join(' ') + '</p>';
@@ -1601,6 +1888,85 @@ function renderFinalReport(reportJson, ctx) {
       '<p>' + esc(ar.summary || '') + '</p>' +
         (ar.reasoning ? '<div class="evidence">' + esc(ar.reasoning) + '</div>' : '')
     );
+
+    const vcScores =
+      (Array.isArray(reportJson.vcAlignmentScores) && reportJson.vcAlignmentScores.length
+        ? reportJson.vcAlignmentScores
+        : null) ||
+      (Array.isArray(ctx.vc?.alignment) && ctx.vc.alignment.length ? ctx.vc.alignment : null);
+    const vcDisc = reportJson.vcDiscovery || {};
+    const vcRef = reportJson.vcReflect || {};
+    if (vcScores && vcScores.length) {
+      const rawQ = vcDisc.query || ctx.vc?.query || '';
+      const qLabel = rawQ || (ctx.vc?.firms?.length ? 'VC discovery' : '');
+      let block =
+        (qLabel ? '<p class="evidence">Discovery query: ' + esc(qLabel) + '</p>' : '') +
+        vcScores
+          .map((s) => {
+            const reasons = (s.topReasons || []).slice(0, 3);
+            const gaps = (s.gaps || []).slice(0, 2);
+            const w = esc(s.website || '');
+            return (
+              '<div class="vc-firm-block">' +
+              '<h4>' +
+              esc(s.firmName || 'Firm') +
+              (w ? ' <a href="' + w + '" target="_blank" rel="noopener">site</a>' : '') +
+              '</h4>' +
+              '<p><strong>Alignment:</strong> ' +
+              esc(s.alignmentScore ?? '—') +
+              '/100</p>' +
+              (reasons.length
+                ? '<p><strong>Why it fits</strong></p><ul>' +
+                  reasons.map((r) => '<li>' + esc(r) + '</li>').join('') +
+                  '</ul>'
+                : '') +
+              (gaps.length
+                ? '<p><strong>Gaps / mismatches</strong></p><ul>' +
+                  gaps.map((g) => '<li>' + esc(g) + '</li>').join('') +
+                  '</ul>'
+                : '') +
+              (s.pitchAngle ? '<p><strong>Pitch angle:</strong> ' + esc(s.pitchAngle) + '</p>' : '') +
+              '</div>'
+            );
+          })
+          .join('');
+      const sup =
+        vcRef.supplementalNotes ||
+        vcRef.supplementalBullets ||
+        ctx.vc?.reflect?.extraDigest ||
+        '';
+      if (sup) {
+        block +=
+          '<p><strong>Reflection follow-up</strong></p><div class="evidence">' +
+          esc(sup).replace(/\n/g, '<br/>') +
+          '</div>';
+      }
+      if (vcRef.rationale || ctx.vc?.reflect?.rationale) {
+        block +=
+          '<div class="evidence">' +
+          esc(vcRef.rationale || ctx.vc.reflect.rationale) +
+          '</div>';
+      }
+      appendReportSection('VC alignment (thesis fit)', block);
+    } else if (ctx.vc?.firms?.length) {
+      appendReportSection(
+        'VC discovery',
+        '<p>Firms were identified but alignment scores were not available in the final JSON.</p><ul>' +
+          ctx.vc.firms
+            .map(
+              (f) =>
+                '<li><strong>' +
+                esc(f.name) +
+                '</strong> — <a href="' +
+                esc(f.website) +
+                '" target="_blank" rel="noopener">' +
+                esc(f.website) +
+                '</a></li>'
+            )
+            .join('') +
+          '</ul>'
+      );
+    }
 
     const conf = reportJson.agentConfidence ?? ctx.finalConfidence ?? 65;
     const cr = reportJson.confidenceRationale || '';

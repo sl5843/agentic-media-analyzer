@@ -2,6 +2,7 @@
   "functions": {
     "api/gemini.js": { "maxDuration": 60 },
     "api/groq.js": { "maxDuration": 60 },
-    "api/serper.js": { "maxDuration": 15 }
+    "api/serper.js": { "maxDuration": 15 },
+    "api/serpapi.js": { "maxDuration": 25 }
   }
 }

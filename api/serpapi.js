@@ -1,0 +1,59 @@
+/**
+ * Google search via SerpAPI (https://serpapi.com) — free tier ~100 searches/mo.
+ * Env: SERPAPI_API_KEY
+ */
+module.exports = async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  const key = process.env.SERPAPI_API_KEY;
+  if (!key) {
+    return res.status(200).json({ configured: false, organic_results: [], source: 'none' });
+  }
+
+  const payload = typeof req.body === 'string' ? safeJson(req.body) : req.body;
+  const q = (payload && String(payload.q || '').trim()) || '';
+  if (!q) {
+    return res.status(400).json({ error: 'Missing q' });
+  }
+
+  const params = new URLSearchParams({
+    engine: 'google',
+    q: q.slice(0, 400),
+    api_key: key,
+    num: '10',
+  });
+
+  try {
+    const url = `https://serpapi.com/search.json?${params.toString()}`;
+    const r = await fetch(url);
+    const data = await r.json();
+    if (data.error) {
+      return res.status(200).json({
+        configured: true,
+        organic_results: [],
+        serpapi_error: String(data.error),
+        source: 'serpapi',
+      });
+    }
+    return res.status(200).json({
+      configured: true,
+      organic_results: data.organic_results || [],
+      source: 'serpapi',
+    });
+  } catch (e) {
+    return res.status(502).json({ error: 'SerpAPI request failed', detail: String(e.message) });
+  }
+};
+
+function safeJson(s) {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
