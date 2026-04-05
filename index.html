@@ -631,11 +631,47 @@ function extractLinks(content) {
 function htmlToText(html) {
   try {
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    const t = doc.body?.innerText || '';
+    const body = doc.body;
+    if (!body) return '';
+    const candidates = [
+      doc.querySelector('article'),
+      doc.querySelector('main'),
+      doc.querySelector('[role="main"]'),
+      body,
+    ].filter(Boolean);
+    let best = '';
+    for (const el of candidates) {
+      const t = (el.innerText || '').replace(/\n{3,}/g, '\n\n').trim();
+      if (t.length > best.length && t.length >= 400) best = t;
+    }
+    const t = best || (body.innerText || '');
     return t.replace(/\n{3,}/g, '\n\n').trim();
   } catch {
     return html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   }
+}
+
+/** Long pages (e.g. publisher nav) put real article in the middle — don't feed only the first N chars to the LLM. */
+function samplePrimaryForModel(text, max) {
+  if (!text || text.length <= max) return text;
+  if (text.length <= max + 3500) {
+    return truncate(text, max);
+  }
+  const len = text.length;
+  const head = Math.floor(max * 0.25);
+  const mid = Math.floor(max * 0.5);
+  const tail = Math.max(200, max - head - mid - 120);
+  const midStart = Math.max(head, Math.floor((len - mid) / 2));
+  const sep = '\n\n[ … middle of page … ]\n\n';
+  const sep2 = '\n\n[ … end of page … ]\n\n';
+  return (
+    text.slice(0, head) +
+    sep +
+    text.slice(midStart, midStart + mid) +
+    sep2 +
+    text.slice(len - tail, len) +
+    '\n\n[…sampled start/middle/end from long page…]'
+  );
 }
 
 function isMeaningfulBody(text) {
@@ -1169,7 +1205,7 @@ async function executeAgentPipeline(urlInput, textInput) {
     }
   }
 
-  const MAX_PRIMARY_STORE = 12000;
+  const MAX_PRIMARY_STORE = 48000;
   if (primaryContent.length > MAX_PRIMARY_STORE) {
     primaryContent =
       primaryContent.slice(0, MAX_PRIMARY_STORE) + '\n\n[…trimmed to save API tokens; original page was longer…]';
@@ -1204,7 +1240,8 @@ Return ONE JSON with all keys: inputType, rationale, plannedSteps, extractionHin
   } else if (urlInput && isPlaceholderPrimaryContent(primaryContent)) {
     planTopicContent = `Submitted URL (page body not retrieved by proxy): ${urlInput}\nInfer type from domain/path; infer topic from URL slug — never echo error placeholders.`;
   } else {
-    planTopicContent = truncate(primaryContent, 3800) + (urlInput ? `\nURL: ${urlInput}` : '');
+    planTopicContent =
+      samplePrimaryForModel(primaryContent, 3800) + (urlInput ? `\nURL: ${urlInput}` : '');
   }
 
   let plan;
@@ -1385,7 +1422,10 @@ Max 3 firms; fewer if results are thin.`;
     const thesisTask = `Extract this VC firm's core investment thesis, key focus areas, and what kinds of companies they look for. Return as structured JSON with keys: coreThesis (string), keyFocusAreas (array of strings), companyProfile (string, what they seek in founders/market/stage).`;
     let thesisObj = null;
     try {
-      const thesisRaw = await analyzeWithGemini(truncate(pageText || firm.website, 10000), thesisTask, {
+      const firmSrc = pageText || firm.website || '';
+      const firmForLlm =
+        firmSrc.length > 12000 ? samplePrimaryForModel(firmSrc, 10000) : truncate(firmSrc, 10000);
+      const thesisRaw = await analyzeWithGemini(firmForLlm, thesisTask, {
         temperature: 0.2,
         json: true,
         retries: 4,
@@ -1415,7 +1455,7 @@ Max 3 firms; fewer if results are thin.`;
   if (vcFirms.length) {
     addStep('vc-score', 'SCORE: alignment vs each VC thesis…', 'thinking');
     const scorePack = {
-      articleExcerpt: truncate(primaryContent, 6000),
+      articleExcerpt: samplePrimaryForModel(primaryContent, 6000),
       firms: vcFirms.map((f) => ({
         name: f.name,
         website: f.website,
@@ -1461,7 +1501,7 @@ Use the same firm order as input. firmName must match.`;
 Return JSON only: {"hasGap":true|false,"rationale":"","suggestedSearchQuery":""}
 If hasGap is false, suggestedSearchQuery must be "".`;
     const reflectBlob = JSON.stringify({
-      articleExcerpt: truncate(primaryContent, 3500),
+      articleExcerpt: samplePrimaryForModel(primaryContent, 3500),
       alignment: vcAlignment,
     }).slice(0, 14000);
     try {
@@ -1569,7 +1609,7 @@ If hasGap is false, suggestedSearchQuery must be "".`;
 
   addStep('compare', 'Cross-referencing (single batched model request)…', 'thinking');
   let comparisons = [];
-  const primaryChunk = truncate(primaryContent, 4000);
+  const primaryChunk = samplePrimaryForModel(primaryContent, 4000);
   comparisons = await compareAllSourcesBatch(primaryChunk, relatedBodies);
   finishStep(
     'compare',
@@ -1699,7 +1739,7 @@ For vcDiscovery / vcAlignmentScores / vcReflect: if no VC research ran, use quer
 
 Context:
 - Input type: ${inputType}
-- Primary excerpt: ${truncate(primaryContent, 4500)}
+- Primary excerpt: ${samplePrimaryForModel(primaryContent, 4500)}
 - Authors/topics JSON: ${JSON.stringify(topicBundle)}
 - Related meta: ${JSON.stringify(relatedBodies.map((r) => ({ title: r.title, url: r.url })))}
 - Comparisons: ${JSON.stringify(comparisons).slice(0, 6000)}
