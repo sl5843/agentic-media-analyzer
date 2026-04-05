@@ -17,7 +17,7 @@ module.exports = async (req, res) => {
   }
 
   const model =
-    (req.query && req.query.model) || process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+    (req.query && req.query.model) || process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite';
 
   const body = typeof req.body === 'string' ? safeJson(req.body) : req.body;
   if (!body || typeof body !== 'object') {

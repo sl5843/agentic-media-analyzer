@@ -296,7 +296,7 @@
   <div class="wrap">
     <header>
       <h1>Agentic media analyzer</h1>
-      <p>Autonomous research loop — uses <strong>Groq</strong> when <code>GROQ_API_KEY</code> is set (recommended free tier), otherwise <strong>Gemini 2.0 Flash</strong>.</p>
+      <p>Autonomous research loop — uses <strong>Groq</strong> when <code>GROQ_API_KEY</code> is set (recommended free tier), otherwise <strong>Gemini 2.0 Flash Lite</strong>.</p>
       <div class="input-row">
         <input type="url" id="url-input" placeholder="https://… article or page URL" autocomplete="off" />
       </div>
@@ -338,7 +338,8 @@
   </div>
 
   <script>
-const GEMINI_MODEL = 'gemini-2.0-flash';
+/** When only GEMINI_API_KEY is set (no Groq), this model is used. Flash-Lite: lower TPM pressure, slightly less capable on long JSON. */
+const GEMINI_MODEL = 'gemini-2.0-flash-lite';
 /** Same-origin API (Vercel serverless). Keys live in Vercel env, not in the browser. */
 const API_GEMINI = '/api/gemini';
 const API_GROQ = '/api/groq';
