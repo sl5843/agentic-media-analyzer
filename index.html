@@ -799,6 +799,32 @@ function sampleVcPageText(text, max = 5200) {
   );
 }
 
+/** One threshold for “enough thesis to score,” step-5 counts, and thesis backfill. */
+function thesisDataSubstantive(data) {
+  if (!data || typeof data !== 'object') return false;
+  return [
+    data.sector_focus,
+    data.stage_focus,
+    data.founder_signals,
+    data.product_signals,
+    data.themes_or_trends,
+    data.check_stage_hint,
+    data.geo_focus,
+    data.avoid_or_out_of_scope,
+  ].some((x) => String(x || '').trim().length > 8);
+}
+
+function thesisDigestLineIsNoise(v) {
+  const t = String(v || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+  if (!t) return true;
+  if (t === 'unknown') return true;
+  if (t === 'unknown · unknown' || t === 'unknown·unknown') return true;
+  return /^unknown(\s*·\s*unknown)+$/i.test(t);
+}
+
 /**
  * Thesis extraction: sequential-friendly, retries, JSON mode then plain JSON parse.
  * Parallel Groq bursts often return 429 on free tier → 0 profiles.
@@ -830,18 +856,7 @@ If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
   try {
     const o = await groqJson(user, sys, true, 2048);
     if (o && typeof o === 'object') {
-      const has =
-        [
-          o.sector_focus,
-          o.stage_focus,
-          o.founder_signals,
-          o.product_signals,
-          o.themes_or_trends,
-          o.check_stage_hint,
-          o.geo_focus,
-          o.avoid_or_out_of_scope,
-        ].some((x) => String(x || '').trim().length > 4);
-      if (has) return { ...o, firm_name: o.firm_name || firmName };
+      if (thesisDataSubstantive(o)) return { ...o, firm_name: o.firm_name || firmName };
     }
   } catch {
     /* try plain completion */
@@ -857,7 +872,7 @@ If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
       2048
     );
     const o = parseJsonLoose(raw);
-    if (o && typeof o === 'object') {
+    if (o && typeof o === 'object' && thesisDataSubstantive(o)) {
       return { ...o, firm_name: o.firm_name || firmName };
     }
   } catch {
@@ -989,11 +1004,14 @@ function sanitizeFreeText(text, corpusLower) {
   return '';
 }
 
-/** When the model cites names/numbers not in the startup JSON, replace line-by-line; rotate to avoid duplicate bullets. */
+/**
+ * User-facing lines when a model bullet cited facts not present on the startup page (replaced by scrubber).
+ * Must not read like system prompts or “internal notes.”
+ */
 const SANITIZER_FALLBACKS = [
-  'Treat thesis overlap as directional only — do not infer customers, revenue, or deals not in the startup JSON.',
-  'Stay within the extracted startup fields for facts; use the fund’s portfolio page to validate fit.',
-  'Match is based on sparse homepage signals; confirm stage, check size, and mandate on the fund’s site.',
+  'Public pages only — any traction or customer claims should be verified from primary materials.',
+  'Overlap is inferred from marketing copy; double-check sector, stage, and check size on the fund’s own site.',
+  'Scores are directional from sparse homepage text, not a substitute for partner diligence.',
 ];
 
 function dedupeStringsPreserveOrder(arr) {
@@ -1094,15 +1112,20 @@ function thesisDigestHtml(firmName, thesisByName) {
   const raw = thesisByName.get(firmName);
   if (!raw || raw._thin) return '';
   const port = Array.isArray(raw.notable_portfolio) ? raw.notable_portfolio.filter(Boolean).slice(0, 5) : [];
-  const lines = [
-    ['Sector / stage', [raw.sector_focus, raw.stage_focus].filter(Boolean).join(' · ')],
+  const ss = [raw.sector_focus, raw.stage_focus].filter((x) => !thesisDigestLineIsNoise(x)).join(' · ');
+  const lines = [];
+  if (ss && !thesisDigestLineIsNoise(ss)) lines.push(['Sector / stage', ss]);
+  const rest = [
     ['Themes', String(raw.themes_or_trends || '').trim()],
     ['Founders', String(raw.founder_signals || '').trim()],
     ['Product signals', String(raw.product_signals || '').trim()],
     ['Check / stage', String(raw.check_stage_hint || '').trim()],
     ['Geo', String(raw.geo_focus || '').trim()],
     ['Out of scope', String(raw.avoid_or_out_of_scope || '').trim()],
-  ].filter(([, v]) => v && v !== 'unknown');
+  ];
+  for (const [k, v] of rest) {
+    if (v && !thesisDigestLineIsNoise(v)) lines.push([k, v]);
+  }
   if (lines.length === 0 && port.length === 0) return '';
   let inner = '<div class="thesis-digest"><strong>Thesis digest</strong> (from fund site)';
   if (lines.length) {
@@ -1164,18 +1187,7 @@ function buildFirmDataQuality(fetchResults, thesisByName) {
       continue;
     }
     const raw = thesisByName.get(r.firm.name);
-    const hasThesis =
-      raw &&
-      [
-        raw.sector_focus,
-        raw.stage_focus,
-        raw.founder_signals,
-        raw.product_signals,
-        raw.themes_or_trends,
-        raw.check_stage_hint,
-        raw.geo_focus,
-        raw.avoid_or_out_of_scope,
-      ].some((x) => String(x || '').trim().length > 8);
+    const hasThesis = raw && thesisDataSubstantive(raw);
     m.set(r.firm.name, hasThesis ? 'ok' : 'thesis_weak');
   }
   return m;
@@ -1428,8 +1440,8 @@ Excerpt:
     const serpPack = JSON.stringify(
       organic.slice(0, 12).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
     ).slice(0, 7500);
-    const pickPrompt = `From these Google results, list up to 8 distinct venture capital firms or funds (not portfolio companies, not news sites). Prefer diverse, relevant funds. JSON: {"firms":[{"name":"","website":"https://..."}]}
-Websites must be the fund's own domain. Return as many solid funds as you can (aim for 6–8) so there are alternates if some sites fail to load.`;
+    const pickPrompt = `From these Google results, list up to 10 distinct venture capital firms or funds (not portfolio companies, not news sites). Prefer diverse, relevant funds. JSON: {"firms":[{"name":"","website":"https://..."}]}
+Websites must be the fund's own domain. Return as many solid funds as you can (aim for 8–10) so there are alternates if some sites fail to load or thesis text is thin.`;
     try {
       const picked = await groqJson(serpPack + '\n\nQuery: ' + searchQ, pickPrompt, true, 1536);
       const arr = Array.isArray(picked?.firms) ? picked.firms : [];
@@ -1448,7 +1460,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
         if (seen.has(host)) continue;
         seen.add(host);
         groqPicks.push({ name, website: w });
-        if (groqPicks.length >= 8) break;
+        if (groqPicks.length >= 10) break;
       }
     } catch {
       groqPicks = [];
@@ -1463,7 +1475,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     `Up to ${VC_TARGET_COUNT} funds · ${candidatePool.length} candidates…`
   );
   const { rows: fetchResults, hostsAttempted } = await fetchVcPagesWithBackfill(candidatePool, VC_TARGET_COUNT);
-  const firms = fetchResults.map((r) => r.firm);
+  let firms = fetchResults.map((r) => r.firm);
   const okFetched = fetchResults.filter((r) => r.ok);
 
   if (firms.length === 0) {
@@ -1500,25 +1512,9 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     const r = thesisInputs[i];
     if (i > 0) await new Promise((res) => setTimeout(res, 700));
     const data = await extractVcThesis(r.text, r.firm.name);
-    const usable =
-      data &&
-      [
-        data.sector_focus,
-        data.stage_focus,
-        data.founder_signals,
-        data.product_signals,
-        data.themes_or_trends,
-        data.check_stage_hint,
-        data.geo_focus,
-        data.avoid_or_out_of_scope,
-      ].some((x) => String(x || '').trim().length > 4);
+    const usable = data && thesisDataSubstantive(data);
     thesisList.push({ firm: r.firm, thesis: data, ok: !!usable });
   }
-  finishStep(
-    's5',
-    'Step 5 — Extract VC theses',
-    `${thesisList.filter((t) => t.ok).length} thesis profiles`
-  );
 
   const thesisByName = new Map();
   for (const t of thesisList) {
@@ -1542,6 +1538,74 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
       });
     }
   }
+
+  function firmHostFromFirm(f) {
+    try {
+      return new URL(f.website).hostname.replace(/^www\./, '');
+    } catch {
+      return '';
+    }
+  }
+
+  const usedForLineup = new Set(
+    fetchResults.map((r) => firmHostFromFirm(r.firm)).filter(Boolean)
+  );
+  const triedAsThesisReplacement = new Set();
+  let thesisSwapNote = '';
+
+  function pickThesisReplacementFirm() {
+    for (const f of candidatePool) {
+      const h = firmHostFromFirm(f);
+      if (!h || usedForLineup.has(h) || triedAsThesisReplacement.has(h)) continue;
+      return f;
+    }
+    return null;
+  }
+
+  let bfRound = 0;
+  while (bfRound < 24) {
+    bfRound++;
+    const strongN = fetchResults.filter((r) =>
+      thesisDataSubstantive(thesisByName.get(r.firm.name))
+    ).length;
+    if (strongN >= VC_TARGET_COUNT) break;
+    const weakIdx = fetchResults.findIndex(
+      (r) => !thesisDataSubstantive(thesisByName.get(r.firm.name))
+    );
+    if (weakIdx < 0) break;
+    const repl = pickThesisReplacementFirm();
+    if (!repl) break;
+    triedAsThesisReplacement.add(firmHostFromFirm(repl));
+    const oldFirm = fetchResults[weakIdx].firm;
+    const oldH = firmHostFromFirm(oldFirm);
+    try {
+      if (bfRound > 1) await new Promise((res) => setTimeout(res, 700));
+      const text = await fetchStartupPage(repl.website);
+      if (!text || text.length < 50) continue;
+      const data = await extractVcThesis(text, repl.name);
+      if (!data || !thesisDataSubstantive(data)) continue;
+      thesisByName.delete(oldFirm.name);
+      if (oldH) usedForLineup.delete(oldH);
+      usedForLineup.add(firmHostFromFirm(repl));
+      fetchResults[weakIdx] = { firm: repl, text, ok: true };
+      thesisByName.set(repl.name, { ...data, _firm: repl });
+      firms = fetchResults.map((r) => r.firm);
+      thesisSwapNote += (thesisSwapNote ? '; ' : '') + `Swapped ${oldFirm.name} → ${repl.name}`;
+    } catch {
+      /* try next candidate */
+    }
+  }
+
+  const substantiveThesisCount = fetchResults.filter((r) =>
+    thesisDataSubstantive(thesisByName.get(r.firm.name))
+  ).length;
+  finishStep(
+    's5',
+    'Step 5 — Extract VC theses',
+    thesisSwapNote
+      ? `${substantiveThesisCount} thesis profiles · ${thesisSwapNote}`
+      : `${substantiveThesisCount} thesis profiles`
+  );
 
   await new Promise((r) => setTimeout(r, 400));
   addStep('s6', 'Step 6 — Score & rank', 'thinking', 'Analyst pass (compact context)…');
@@ -1671,7 +1735,7 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
             : ''
         }
         ${r.analyst_read && !r.unscorable ? `<div class="analyst-read">${esc(r.analyst_read)}</div>` : ''}
-        ${thesisDigestHtml(r.firm_name, thesisByName)}
+        ${!r.unscorable ? thesisDigestHtml(r.firm_name, thesisByName) : ''}
         <p><strong>Why it fits</strong></p>
         <ul>${reasons.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>
         <p><strong>Gaps</strong></p>
@@ -1755,7 +1819,7 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
       `Startup sector/stage: ${startupSlim.sector} / ${startupSlim.stage}. Scores: ${rankLine}.
 N/A means fund thesis was missing (fetch or extraction), not a numeric score of zero.
 Return JSON only: {"biggest_uncertainty":"","confidence_0_to_100":70}
-biggest_uncertainty = one short paragraph on the single biggest uncertainty in these scores (methodology/data limits, not “funds didn’t invest”).`,
+biggest_uncertainty = one short paragraph on methodology limits (thin homepages, extracted text only) — not “funds passed” or “missing scores mean rejection.”`,
       'JSON only.',
       true,
       1024
