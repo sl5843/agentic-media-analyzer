@@ -325,6 +325,9 @@ const FALLBACK_VCS = [
   { name: 'Antler', website: 'https://www.antler.co/' },
 ];
 
+/** VC funds to fetch, extract theses for, and score (lower = faster). */
+const VC_TARGET_COUNT = 3;
+
 const state = { stepEls: new Map(), groqOk: false };
 
 function esc(s) {
@@ -1186,8 +1189,8 @@ Excerpt:
     const serpPack = JSON.stringify(
       organic.slice(0, 12).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
     ).slice(0, 7500);
-    const pickPrompt = `From these Google results, list up to 10 distinct venture capital firms or funds (not portfolio companies, not news sites). Prefer diverse, relevant funds. JSON: {"firms":[{"name":"","website":"https://..."}]}
-Websites must be the fund's own domain. Return as many solid funds as you can (aim for 8–10).`;
+    const pickPrompt = `From these Google results, list up to 8 distinct venture capital firms or funds (not portfolio companies, not news sites). Prefer diverse, relevant funds. JSON: {"firms":[{"name":"","website":"https://..."}]}
+Websites must be the fund's own domain. Return as many solid funds as you can (aim for 6–8) so there are alternates if some sites fail to load.`;
     try {
       const picked = await groqJson(serpPack + '\n\nQuery: ' + searchQ, pickPrompt, true, 1536);
       const arr = Array.isArray(picked?.firms) ? picked.firms : [];
@@ -1206,7 +1209,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
         if (seen.has(host)) continue;
         seen.add(host);
         groqPicks.push({ name, website: w });
-        if (groqPicks.length >= 10) break;
+        if (groqPicks.length >= 8) break;
       }
     } catch {
       groqPicks = [];
@@ -1218,9 +1221,9 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
   addStep(
     's4',
     'Step 4 — Fetch VC sites (parallel)',
-    `Up to 5 funds · ${candidatePool.length} candidates…`
+    `Up to ${VC_TARGET_COUNT} funds · ${candidatePool.length} candidates…`
   );
-  const { rows: fetchResults, hostsAttempted } = await fetchVcPagesWithBackfill(candidatePool, 5);
+  const { rows: fetchResults, hostsAttempted } = await fetchVcPagesWithBackfill(candidatePool, VC_TARGET_COUNT);
   const firms = fetchResults.map((r) => r.firm);
   const okFetched = fetchResults.filter((r) => r.ok);
 
