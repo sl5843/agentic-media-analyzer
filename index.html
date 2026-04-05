@@ -628,6 +628,86 @@ async function mapPool(items, concurrency, fn) {
   return results;
 }
 
+/** Groq picks first, then fallbacks; dedupe by hostname. */
+function mergeCandidatePool(primaryFirms, fallbackList) {
+  const seen = new Set();
+  const out = [];
+  for (const list of [primaryFirms, fallbackList]) {
+    for (const f of list) {
+      const name = String(f?.name || '').trim();
+      let w = String(f?.website || '').trim();
+      if (!name || !w) continue;
+      if (!/^https?:\/\//i.test(w)) w = 'https://' + w;
+      let h = '';
+      try {
+        h = new URL(w).hostname.replace(/^www\./, '');
+      } catch {
+        continue;
+      }
+      if (seen.has(h)) continue;
+      seen.add(h);
+      out.push({ name, website: w });
+    }
+  }
+  return out;
+}
+
+/**
+ * Fetch VC homepages in parallel waves; skip failed hosts and pull more from pool until `target`
+ * successes or the pool is exhausted (so Serp picks that 404 are replaced by alts, not “insufficient” slots).
+ */
+async function fetchVcPagesWithBackfill(pool, target) {
+  const triedHosts = new Set();
+  const okRows = [];
+
+  async function fetchOne(f) {
+    let h = '';
+    try {
+      h = new URL(f.website).hostname.replace(/^www\./, '');
+    } catch {
+      return null;
+    }
+    if (triedHosts.has(h)) return null;
+    triedHosts.add(h);
+    try {
+      const text = await fetchStartupPage(f.website);
+      return { firm: f, text, ok: true };
+    } catch {
+      return { firm: f, text: '', ok: false };
+    }
+  }
+
+  function peekNextFirms(n) {
+    const batch = [];
+    for (const f of pool) {
+      if (batch.length >= n) break;
+      let h = '';
+      try {
+        h = new URL(f.website).hostname.replace(/^www\./, '');
+      } catch {
+        continue;
+      }
+      if (triedHosts.has(h)) continue;
+      batch.push(f);
+    }
+    return batch;
+  }
+
+  let batch = peekNextFirms(target);
+  let batchResults = (await Promise.all(batch.map((f) => fetchOne(f)))).filter(Boolean);
+  okRows.push(...batchResults.filter((r) => r.ok));
+
+  while (okRows.length < target) {
+    const need = target - okRows.length;
+    batch = peekNextFirms(Math.min(need + 3, 8));
+    if (batch.length === 0) break;
+    batchResults = (await Promise.all(batch.map((f) => fetchOne(f)))).filter(Boolean);
+    okRows.push(...batchResults.filter((r) => r.ok));
+  }
+
+  return { rows: okRows.slice(0, target), hostsAttempted: triedHosts.size };
+}
+
 /** Long pages + long prompts exceed Groq 8B free TPM (~6k); keep excerpts compact. */
 function sampleVcPageText(text, max = 5200) {
   if (!text || text.length <= max) return text;
@@ -1084,7 +1164,7 @@ Excerpt:
 
   addStep('s3', 'Step 3 — Discover VCs', 'thinking', searchQ.slice(0, 80) + '…');
   let organic = [];
-  let usedFallback = false;
+  let serpDiscoveryFailed = false;
   const serp = await serpApiSearch(searchQ);
   if (
     serp.configured &&
@@ -1095,19 +1175,19 @@ Excerpt:
     organic = serp.organic_results;
     finishStep('s3', 'Step 3 — Discover VCs', `SerpAPI · ${organic.length} results`);
   } else {
-    usedFallback = true;
+    serpDiscoveryFailed = true;
     userNote =
       'Search was unavailable, so the agent used a fixed list of active early-stage funds for comparison.';
     finishStep('s3', 'Step 3 — Discover VCs', 'Using curated seed-stage VC list');
   }
 
-  let firms = [];
-  if (!usedFallback) {
+  let groqPicks = [];
+  if (organic.length > 0) {
     const serpPack = JSON.stringify(
-      organic.slice(0, 10).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
-    ).slice(0, 7000);
-    const pickPrompt = `From these Google results, list exactly 5 distinct venture capital firms or funds (not portfolio companies, not news sites). JSON: {"firms":[{"name":"","website":"https://..."}]}
-Websites must be the fund's own domain.`;
+      organic.slice(0, 12).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
+    ).slice(0, 7500);
+    const pickPrompt = `From these Google results, list up to 10 distinct venture capital firms or funds (not portfolio companies, not news sites). Prefer diverse, relevant funds. JSON: {"firms":[{"name":"","website":"https://..."}]}
+Websites must be the fund's own domain. Return as many solid funds as you can (aim for 8–10).`;
     try {
       const picked = await groqJson(serpPack + '\n\nQuery: ' + searchQ, pickPrompt, true, 1536);
       const arr = Array.isArray(picked?.firms) ? picked.firms : [];
@@ -1125,52 +1205,45 @@ Websites must be the fund's own domain.`;
         }
         if (seen.has(host)) continue;
         seen.add(host);
-        firms.push({ name, website: w });
-        if (firms.length >= 5) break;
+        groqPicks.push({ name, website: w });
+        if (groqPicks.length >= 10) break;
       }
     } catch {
-      firms = [];
+      groqPicks = [];
     }
-  }
-  if (firms.length < 5) {
-    const seenH = new Set(firms.map((f) => {
-      try {
-        return new URL(f.website).hostname.replace(/^www\./, '');
-      } catch {
-        return f.website;
-      }
-    }));
-    for (const f of FALLBACK_VCS) {
-      if (firms.length >= 5) break;
-      let h = '';
-      try {
-        h = new URL(f.website).hostname.replace(/^www\./, '');
-      } catch {
-        continue;
-      }
-      if (seenH.has(h)) continue;
-      seenH.add(h);
-      firms.push({ name: f.name, website: f.website });
-    }
-    usedFallback = true;
   }
 
-  addStep('s4', 'Step 4 — Fetch VC sites (parallel)', 'thinking', `${firms.length} sites…`);
-  const fetchResults = await Promise.all(
-    firms.map(async (f) => {
-      try {
-        const text = await fetchStartupPage(f.website);
-        return { firm: f, text, ok: true };
-      } catch {
-        return { firm: f, text: '', ok: false };
-      }
-    })
+  const candidatePool = mergeCandidatePool(groqPicks, FALLBACK_VCS);
+
+  addStep(
+    's4',
+    'Step 4 — Fetch VC sites (parallel)',
+    `Up to 5 funds · ${candidatePool.length} candidates…`
   );
+  const { rows: fetchResults, hostsAttempted } = await fetchVcPagesWithBackfill(candidatePool, 5);
+  const firms = fetchResults.map((r) => r.firm);
   const okFetched = fetchResults.filter((r) => r.ok);
+
+  if (firms.length === 0) {
+    failStep(
+      's4',
+      'Step 4 — Fetch VC sites (parallel)',
+      'No fund homepages could be loaded — try again or check network / proxy.'
+    );
+    appendSection(
+      `<h2>VC fetch failed</h2><p class="evidence">Tried ${hostsAttempted} candidate sites from discovery and the curated list.</p>`
+    );
+    return;
+  }
+
+  let backfillNote = '';
+  if (hostsAttempted > firms.length) {
+    backfillNote = ` (${hostsAttempted} candidates tried; failed loads skipped for alternates)`;
+  }
   finishStep(
     's4',
     'Step 4 — Fetch VC sites (parallel)',
-    `${okFetched.length}/${firms.length} loaded`
+    `${okFetched.length} loaded${backfillNote}`
   );
 
   addStep(
@@ -1313,8 +1386,8 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
   }
 
   let vcCardsHtml = '<h2>VC match rankings</h2>';
-  if (usedFallback) {
-    vcCardsHtml += '<p class="evidence">Discovery used a curated fund list so scoring could continue.</p>';
+  if (serpDiscoveryFailed) {
+    vcCardsHtml += '<p class="evidence">SerpAPI had no results, so discovery started from the curated fund list.</p>';
   }
   const firstScorableIdx = rankings.findIndex((r) => !r.unscorable);
   vcCardsHtml += '<div class="vc-grid">';
