@@ -764,6 +764,138 @@ function verdictClass(verdict) {
   return 'verdict-weak';
 }
 
+function jsonCorpusLower(obj) {
+  return JSON.stringify(obj ?? {}).toLowerCase();
+}
+
+/** Dollar amounts and large round figures must appear in allowed corpus or the line is dropped. */
+function moneyFragmentsSupported(text, corpusLower) {
+  if (!text || !corpusLower) return true;
+  const re =
+    /\$[\d,.]+(?:\s*[kKmMbB])?|\b\d[\d,.]*(?:\.\d+)?\s*(?:million|billion|thousand)\b|\b\d[\d,.]*\s*[kKmMbB]\b|\b\d[\d,.]*[kKmMbB]\b/gi;
+  let m;
+  const t = text;
+  while ((m = re.exec(t)) !== null) {
+    const raw = m[0].toLowerCase().replace(/\s+/g, ' ').trim();
+    const noComma = raw.replace(/,/g, '');
+    if (!corpusLower.includes(raw) && !corpusLower.includes(noComma)) return false;
+  }
+  return true;
+}
+
+const PROPER_SKIP = new Set(
+  `the and but for with when from this that these those into over also very just only same each both than some most many such other well even they them their there then what which while where work bench focus stage sector fund firm deal deals growth early seed potential strong weak limited review confirm align matches data team teams tools platform product market analytics software technology technologies business model differentiator description line company name unknown founders customers investors companies enterprise commercial scalable vertical ecosystem pipeline outcomes results healthcare financial services`.split(
+    /\s+/
+  )
+);
+
+/** Multi-word titles and 5+ letter capitals must appear in corpus (startup + thesis + fund name). */
+function properNounsSupported(text, corpusLower) {
+  if (!text || !corpusLower) return true;
+  const multi = text.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b/g) || [];
+  for (const phrase of multi) {
+    const low = phrase.toLowerCase();
+    if (corpusLower.includes(low)) continue;
+    if (corpusLower.includes(low.replace(/\s+/g, '-'))) continue;
+    if (corpusLower.includes(low.replace(/\s+/g, ''))) continue;
+    return false;
+  }
+  const singles = text.match(/\b[A-Z][a-z]{4,}\b/g) || [];
+  for (const w of singles) {
+    const low = w.toLowerCase();
+    if (PROPER_SKIP.has(low)) continue;
+    if (corpusLower.includes(low)) continue;
+    return false;
+  }
+  const acronyms = text.match(/\b[A-Z]{4,}\b/g) || [];
+  for (const a of acronyms) {
+    const low = a.toLowerCase();
+    if (corpusLower.includes(low)) continue;
+    return false;
+  }
+  return true;
+}
+
+function sanitizeFreeText(text, corpusLower) {
+  if (text == null || typeof text !== 'string') return '';
+  const s = text.trim();
+  if (!s) return '';
+  if (moneyFragmentsSupported(s, corpusLower) && properNounsSupported(s, corpusLower)) return s;
+  return '';
+}
+
+const GENERIC_REASON =
+  'Refer only to facts in the extracted startup profile — do not invent revenue, customers, or metrics.';
+
+function sanitizeRankingAgainstStartup(row, startupSlim, thesisByName) {
+  const t = thesisByName.get(row.firm_name) || {};
+  const thesisSlim = slimThesisForLlm(t);
+  const corpusLower = `${jsonCorpusLower(startupSlim)}\n${jsonCorpusLower(thesisSlim)}\n${String(row.firm_name || '').toLowerCase()}`;
+  const scrub = (s) => sanitizeFreeText(String(s || ''), corpusLower) || GENERIC_REASON;
+  const verdictRaw = String(row.one_sentence_verdict || '').trim();
+  const verdictClean = sanitizeFreeText(verdictRaw, corpusLower);
+  return {
+    ...row,
+    top_reasons: (Array.isArray(row.top_reasons) ? row.top_reasons : []).map((x) => scrub(x)),
+    gaps: (Array.isArray(row.gaps) ? row.gaps : []).map((x) => scrub(x)),
+    one_sentence_verdict:
+      verdictClean || 'Potential fit — validate using only startup JSON fields and the fund thesis.',
+  };
+}
+
+/** Voice / smart-device thesis vs data-analytics startup (no voice in JSON) → cap score. */
+function clampVoiceThesisVsDataStartup(row, startupSlim, thesisByName) {
+  const t = thesisByName.get(row.firm_name) || {};
+  const thesisSlim = slimThesisForLlm(t);
+  const startupLower = jsonCorpusLower(startupSlim);
+  const thesisLower = jsonCorpusLower(thesisSlim) + '\n' + String(row.firm_name || '').toLowerCase();
+  const voiceInThesis =
+    /\b(voice assistant|smart home|\balexa\b|speech recognition|conversational ai|smart speaker|smart device)\b/i.test(
+      thesisLower
+    );
+  const voiceInStartup =
+    /\b(voice assistant|smart home|\balexa\b|speech recognition|conversational ai|smart speaker)\b/i.test(
+      startupLower
+    );
+  const dataProduct =
+    /\b(analytics|data team|data stack|bi\b|business intelligence|notebook|semantic layer|warehouse|sql)\b/i.test(
+      startupLower
+    );
+  if (!voiceInThesis || voiceInStartup || !dataProduct) return row;
+  const prev = Number(row.alignment_score);
+  const score = Math.min(Number.isNaN(prev) ? 0 : prev, 28);
+  return {
+    ...row,
+    alignment_score: score,
+    one_sentence_verdict: 'Weak fit — fund centers on voice/smart devices; startup profile reads as data/analytics software.',
+    top_reasons: [
+      'Fund thesis emphasizes voice assistants, smart home, or related hardware ecosystems.',
+      'Startup JSON centers on data/analytics workflows without citing voice or device platforms.',
+      'High numeric scores for this pairing are usually misleading without explicit product overlap.',
+    ],
+    gaps: [
+      'No startup-field evidence that the product targets voice UX, OEM devices, or smart-home channels.',
+      'Confirm mandate with the fund’s latest investments before spending time on outreach.',
+    ],
+  };
+}
+
+function sanitizePitchParagraph(text, startupSlim, vcFirmName) {
+  const corpusLower = `${jsonCorpusLower(startupSlim)}\n${String(vcFirmName || '').toLowerCase()}`;
+  const parts = String(text || '')
+    .split(/(?<=[.!?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const kept = parts.filter((s) => moneyFragmentsSupported(s, corpusLower) && properNounsSupported(s, corpusLower));
+  if (kept.length === 0) {
+    return (
+      'Angle the pitch using only the fields in the startup JSON (company, sector, model, differentiator). ' +
+      'Tie those to the VC thesis language without inventing customers, revenue, or outcomes.'
+    );
+  }
+  return kept.join(' ');
+}
+
 /** Per firm: ok thesis vs fetch failed vs page loaded but thesis too thin. */
 function buildFirmDataQuality(fetchResults, thesisByName) {
   const m = new Map();
@@ -1102,7 +1234,11 @@ Websites must be the fund's own domain.`;
 ${JSON.stringify(scorePack).slice(0, 12000)}
 
 Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"top_reasons":["","",""],"gaps":["",""],"one_sentence_verdict":""}]}
-Rules: exactly one ranking per VC above in the same order; each top_reasons must have 3 non-empty strings; each gaps must have 2 non-empty strings; verdict must start with Strong fit, Potential fit, or Weak fit; cite thesis language.`;
+Rules: exactly one ranking per VC above in the same order; each top_reasons must have 3 non-empty strings; each gaps must have 2 non-empty strings; verdict must start with Strong fit, Potential fit, or Weak fit; cite thesis language.
+
+CRITICAL — no hallucinations: In top_reasons and gaps, never mention revenue, ARR, funding rounds, customer or partner names, user counts, or geographies unless that exact fact appears in the startup object above. If startup.stage is "unknown", do not claim stage alignment with the fund.
+
+If the fund thesis centers on a narrow vertical (e.g. voice assistants, smart home, crypto, defense) and the startup JSON does not mention that vertical, alignment_score must be at most 35 and gaps must state the mismatch clearly.`;
 
   let rankings = [];
   try {
@@ -1116,7 +1252,9 @@ Rules: exactly one ranking per VC above in the same order; each top_reasons must
     try {
       const perVc = await mapPool(firms, 2, async (f) => {
         const t = slimThesisForLlm(thesisByName.get(f.name) || {});
-        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score (0-100), top_reasons (3 non-empty strings), gaps (2 non-empty strings), one_sentence_verdict. firm_name must be exactly ${JSON.stringify(f.name)}.`;
+        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score (0-100), top_reasons (3 non-empty strings), gaps (2 non-empty strings), one_sentence_verdict. firm_name must be exactly ${JSON.stringify(f.name)}.
+
+Never invent revenue, customers, or metrics. Only cite startup facts present in the JSON. If startup.stage is "unknown", do not claim stage fit. If the fund thesis is narrowly vertical (voice/smart home, crypto, etc.) and the startup JSON does not mention that vertical, cap alignment_score at 35.`;
         try {
           const row = await groqJson(one, 'One VC score. JSON only.', true, 2048);
           if (row && (row.alignment_score != null || row.top_reasons)) {
@@ -1149,6 +1287,9 @@ Rules: exactly one ranking per VC above in the same order; each top_reasons must
       }));
     }
   }
+
+  rankings = rankings.map((row) => sanitizeRankingAgainstStartup(row, startupSlim, thesisByName));
+  rankings = rankings.map((row) => clampVoiceThesisVsDataStartup(row, startupSlim, thesisByName));
 
   const firmQuality = buildFirmDataQuality(fetchResults, thesisByName);
   rankings = rankings.map((row) =>
@@ -1224,7 +1365,7 @@ Rules: exactly one ranking per VC above in the same order; each top_reasons must
         4,
         768
       );
-      pitchParagraph = pitchRaw.trim();
+      pitchParagraph = sanitizePitchParagraph(pitchRaw.trim(), startupSlim, topFirm.firm_name);
     } catch {
       try {
         const pitchRaw2 = await groqCompleteRetry(
@@ -1234,7 +1375,7 @@ Rules: exactly one ranking per VC above in the same order; each top_reasons must
           3,
           640
         );
-        pitchParagraph = pitchRaw2.trim();
+        pitchParagraph = sanitizePitchParagraph(pitchRaw2.trim(), startupSlim, topFirm.firm_name);
       } catch {
         pitchParagraph =
           'Pitch reframe could not be generated (often rate limits). Wait a minute and re-run, or shorten the day’s Groq usage.';
