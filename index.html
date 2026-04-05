@@ -220,6 +220,10 @@
       padding: 0.2rem 0.5rem;
       border-radius: 6px;
       border: 1px solid var(--panel-border);
+      white-space: normal;
+      max-width: min(100%, 16rem);
+      line-height: 1.35;
+      text-align: left;
     }
     .verdict-strong { border-color: var(--done); color: var(--done); }
     .verdict-potential { border-color: var(--thinking); color: var(--thinking); }
@@ -757,6 +761,36 @@ function verdictClass(verdict) {
   return 'verdict-weak';
 }
 
+/** Model sometimes returns empty arrays; keep UI lists complete. */
+function normalizeRankingRow(r) {
+  const firm_name = String(r?.firm_name || '').trim() || 'Unknown';
+  let score = Number(r?.alignment_score);
+  if (Number.isNaN(score)) score = 0;
+  score = Math.min(100, Math.max(0, score));
+  let reasons = (Array.isArray(r?.top_reasons) ? r.top_reasons : [])
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+  let gaps = (Array.isArray(r?.gaps) ? r.gaps : [])
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+  while (reasons.length < 3) {
+    reasons.push('No specific fit reason returned — use fund thesis and portfolio to validate.');
+  }
+  while (gaps.length < 2) {
+    gaps.push('Confirm stage, sector, and check size against this fund’s recent deals.');
+  }
+  const verdict =
+    String(r?.one_sentence_verdict || '').trim() ||
+    (score >= 60 ? 'Potential fit — validate thesis alignment.' : 'Weak fit — limited overlap on available signals.');
+  return {
+    firm_name,
+    alignment_score: score,
+    top_reasons: reasons.slice(0, 3),
+    gaps: gaps.slice(0, 2),
+    one_sentence_verdict: verdict,
+  };
+}
+
 async function runPipeline(startupUrl) {
   state.stepEls.clear();
   document.getElementById('agent-log').innerHTML = '';
@@ -779,7 +813,17 @@ async function runPipeline(startupUrl) {
   }
 
   addStep('s2', 'Step 2 — Analyze startup', 'thinking', 'Structured profile via Groq…');
+  const hostHint = (() => {
+    try {
+      return new URL(startupUrl).hostname.replace(/^www\./, '');
+    } catch {
+      return '';
+    }
+  })();
+
   const analyzeIntro = `From the website excerpt, return JSON with keys: company_name, one_line_description, sector (specific), stage (pre-seed|seed|series-a|unknown), business_model, key_differentiator, target_customer, traction_signals (string or array), founding_team_signals (string or array). Use unknown or "" if missing.
+
+Rules: company_name must be the company OPERATING this site (the product/vendor behind ${hostHint || 'the domain'}), not a customer or case-study subject unless the page is clearly that customer’s site. one_line_description should describe that operator’s product, not a third-party headline.
 
 Excerpt:
 `;
@@ -987,7 +1031,7 @@ Websites must be the fund's own domain.`;
 ${JSON.stringify(scorePack).slice(0, 12000)}
 
 Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"top_reasons":["","",""],"gaps":["",""],"one_sentence_verdict":""}]}
-Rules: exactly one ranking per VC above in the same order; verdict must start with Strong fit, Potential fit, or Weak fit; cite thesis language; no generic fluff.`;
+Rules: exactly one ranking per VC above in the same order; each top_reasons must have 3 non-empty strings; each gaps must have 2 non-empty strings; verdict must start with Strong fit, Potential fit, or Weak fit; cite thesis language.`;
 
   let rankings = [];
   try {
@@ -1001,7 +1045,7 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
     try {
       const perVc = await mapPool(firms, 2, async (f) => {
         const t = slimThesisForLlm(thesisByName.get(f.name) || {});
-        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score, number 0-100, top_reasons array of 3 strings, gaps array of 2 strings, one_sentence_verdict string. firm_name must be exactly ${JSON.stringify(f.name)}.`;
+        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score (0-100), top_reasons (3 non-empty strings), gaps (2 non-empty strings), one_sentence_verdict. firm_name must be exactly ${JSON.stringify(f.name)}.`;
         try {
           const row = await groqJson(one, 'One VC score. JSON only.', true, 2048);
           if (row && (row.alignment_score != null || row.top_reasons)) {
@@ -1037,6 +1081,7 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
   finishStep('s6', 'Step 6 — Score & rank', `${rankings.length} firms scored`);
 
   rankings.sort((a, b) => (b.alignment_score || 0) - (a.alignment_score || 0));
+  rankings = rankings.map(normalizeRankingRow);
 
   let vcCardsHtml = '<h2>VC match rankings</h2>';
   if (usedFallback) {
@@ -1048,12 +1093,13 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
     const reasons = (r.top_reasons || []).slice(0, 3);
     const gaps = (r.gaps || []).slice(0, 2);
     const verdict = r.one_sentence_verdict || 'Potential fit — review thesis.';
+    const verdictShort = verdict.split('—')[0].trim();
     const top = idx === 0;
     vcCardsHtml += `
       <div class="vc-card${top ? ' top-rank' : ''}" data-rank="${idx}">
         <div class="vc-card-head">
           <strong>${esc(r.firm_name)}</strong>
-          <span class="verdict-badge ${verdictClass(verdict)}">${esc(verdict.split('—')[0].trim().slice(0, 40))}</span>
+          <span class="verdict-badge ${verdictClass(verdict)}" title="${esc(verdict)}">${esc(verdictShort)}</span>
         </div>
         <div class="score-row">
           <span class="score-num">${score}</span>
@@ -1082,7 +1128,7 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
     try {
       const pitchRaw = await groqCompleteRetry(
         `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis (compact):\n${JSON.stringify(thesisPitchPack)}\n\nWrite ONE paragraph only.`,
-        'You are a startup pitch coach. Based on this VC thesis and this startup, write a single paragraph telling the founder exactly how to reposition pitch messaging to resonate with this VC. Be concrete; reference the VC investment language. No bullet points.',
+        'You are a startup pitch coach. Use ONLY facts present in the Startup JSON above. Do not invent revenue figures, customer names, funding, or geographies. Based on this VC thesis and startup facts, write one paragraph on how to angle the pitch; reference the VC’s stated language. No bullet points.',
         false,
         4,
         768
@@ -1091,8 +1137,8 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
     } catch {
       try {
         const pitchRaw2 = await groqCompleteRetry(
-          `Startup: ${startupSlim.company_name} — ${startupSlim.one_line_description}. Sector: ${startupSlim.sector}. Differentiator: ${startupSlim.key_differentiator}.\n\nInvestor: ${topFirm.firm_name}. Known thesis summary: ${JSON.stringify(thesisPitchPack).slice(0, 1200)}.\n\nOne paragraph: how should the founder angle the pitch for this firm?`,
-          'One short paragraph, no bullets.',
+          `Startup: ${startupSlim.company_name} — ${startupSlim.one_line_description}. Sector: ${startupSlim.sector}. Differentiator: ${startupSlim.key_differentiator}.\n\nInvestor: ${topFirm.firm_name}. Known thesis summary: ${JSON.stringify(thesisPitchPack).slice(0, 1200)}.\n\nOne paragraph: how should the founder angle the pitch for this firm? Do not invent metrics or customers not listed above.`,
+          'One short paragraph, no bullets. Facts only from the startup line above.',
           false,
           3,
           640
