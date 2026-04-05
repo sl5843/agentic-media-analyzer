@@ -485,16 +485,80 @@ async function groqComplete(userContent, systemHint, jsonMode = true) {
   return String(text);
 }
 
+async function groqCompleteRetry(userContent, systemHint, jsonMode = true, maxAttempts = 4) {
+  let lastErr;
+  for (let a = 0; a < maxAttempts; a++) {
+    try {
+      if (a > 0) {
+        const wait = 900 * a * a + Math.random() * 400;
+        await new Promise((r) => setTimeout(r, wait));
+      }
+      return await groqComplete(userContent, systemHint, jsonMode);
+    } catch (e) {
+      lastErr = e;
+      const msg = e.message || '';
+      if (!/429|rate|limit|token/i.test(msg) || a === maxAttempts - 1) throw e;
+    }
+  }
+  throw lastErr;
+}
+
+function slimStartupForLlm(s) {
+  const ts = s.traction_signals;
+  const traction = Array.isArray(ts) ? ts.slice(0, 5).join('; ') : String(ts || '').slice(0, 400);
+  return {
+    company_name: String(s.company_name || '').slice(0, 120),
+    one_line_description: String(s.one_line_description || '').slice(0, 500),
+    sector: String(s.sector || '').slice(0, 120),
+    stage: String(s.stage || '').slice(0, 40),
+    business_model: String(s.business_model || '').slice(0, 80),
+    key_differentiator: String(s.key_differentiator || '').slice(0, 500),
+    target_customer: String(s.target_customer || '').slice(0, 400),
+    traction_signals: traction.slice(0, 500),
+  };
+}
+
+function slimThesisForLlm(t) {
+  if (!t || typeof t !== 'object') return {};
+  const th = t.themes_or_trends;
+  const themes = Array.isArray(th) ? th.slice(0, 6).join('; ') : String(th || '');
+  return {
+    firm_name: String(t.firm_name || '').slice(0, 100),
+    stage_focus: String(t.stage_focus || '').slice(0, 250),
+    sector_focus: String(t.sector_focus || '').slice(0, 500),
+    founder_signals: String(t.founder_signals || '').slice(0, 500),
+    product_signals: String(t.product_signals || '').slice(0, 500),
+    themes_or_trends: themes.slice(0, 500),
+    notable_portfolio: Array.isArray(t.notable_portfolio) ? t.notable_portfolio.slice(0, 6) : [],
+  };
+}
+
+async function mapPool(items, concurrency, fn) {
+  const results = new Array(items.length);
+  let ix = 0;
+  async function worker() {
+    while (true) {
+      const i = ix++;
+      if (i >= items.length) break;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  const n = Math.max(1, Math.min(concurrency, items.length));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
+}
+
 async function groqJson(userContent, systemHint, strictRetry = true) {
-  let raw = await groqComplete(userContent, systemHint, true);
+  let raw = await groqCompleteRetry(userContent, systemHint, true);
   let parsed = parseJsonLoose(raw);
   if (parsed && typeof parsed === 'object') return parsed;
   if (strictRetry) {
-    raw = await groqComplete(
+    raw = await groqCompleteRetry(
       userContent +
         '\n\nYour previous reply was not valid JSON. Reply with ONE valid JSON object only, minified, no markdown.',
       'Output only a single JSON object. No prose.',
-      true
+      true,
+      3
     );
     parsed = parseJsonLoose(raw);
     if (parsed && typeof parsed === 'object') return parsed;
@@ -717,22 +781,19 @@ Websites must be the fund's own domain.`;
 
 If the page is thin, infer cautiously from navigation/about and mark uncertainty in sector_focus.`;
 
-  const thesisPromises = fetchResults
-    .filter((r) => r.ok && r.text.length > 50)
-    .map(async (r) => {
-      try {
-        const data = await groqJson(
-          r.text.slice(0, 12000),
-          thesisTask + '\nReturn JSON only.',
-          true
-        );
-        return { firm: r.firm, thesis: data, ok: true };
-      } catch {
-        return { firm: r.firm, thesis: null, ok: false };
-      }
-    });
-
-  const thesisList = await Promise.all(thesisPromises);
+  const thesisInputs = fetchResults.filter((r) => r.ok && r.text.length > 50);
+  const thesisList = await mapPool(thesisInputs, 2, async (r) => {
+    try {
+      const data = await groqJson(
+        r.text.slice(0, 10000),
+        thesisTask + '\nReturn JSON only.',
+        true
+      );
+      return { firm: r.firm, thesis: data, ok: true };
+    } catch {
+      return { firm: r.firm, thesis: null, ok: false };
+    }
+  });
   finishStep(
     's5',
     'Step 5 — Extract VC theses (parallel)',
@@ -759,36 +820,67 @@ If the page is thin, infer cautiously from navigation/about and mark uncertainty
     }
   }
 
-  addStep('s6', 'Step 6 — Score & rank', 'thinking', 'One analyst pass…');
+  addStep('s6', 'Step 6 — Score & rank', 'thinking', 'Analyst pass (compact context)…');
+  const startupSlim = slimStartupForLlm(startup);
   const scorePack = {
-    startup,
+    startup: startupSlim,
     vcs: firms.map((f) => ({
       name: f.name,
-      website: f.website,
-      thesis: thesisByName.get(f.name) || {},
+      thesis: slimThesisForLlm(thesisByName.get(f.name) || {}),
     })),
   };
 
   const scorePrompt = `You are a senior venture analyst. Score how well this startup aligns with each VC firm's thesis (1-100).
 
-${JSON.stringify(scorePack).slice(0, 28000)}
+${JSON.stringify(scorePack)}
 
 Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"top_reasons":["","",""],"gaps":["",""],"one_sentence_verdict":""}]}
-Rules: one entry per firm in order; verdict must start with Strong fit, Potential fit, or Weak fit; be specific and quote thesis language; no generic fluff.`;
+Rules: exactly one ranking per VC above in the same order; verdict must start with Strong fit, Potential fit, or Weak fit; cite thesis language; no generic fluff.`;
 
   let rankings = [];
   try {
     const scored = await groqJson(scorePrompt, 'JSON only. Valid rankings array.', true);
     rankings = Array.isArray(scored?.rankings) ? scored.rankings : [];
   } catch (e) {
-    failStep('s6', 'Step 6 — Score & rank', 'Could not score; showing partial data.');
-    rankings = firms.map((f) => ({
-      firm_name: f.name,
-      alignment_score: 0,
-      top_reasons: ['Scoring step did not complete.'],
-      gaps: ['Try again shortly.'],
-      one_sentence_verdict: 'Weak fit — analysis incomplete.',
-    }));
+    /* bulk score failed — use per-VC below */
+  }
+
+  if (rankings.length < firms.length) {
+    try {
+      const perVc = await mapPool(firms, 2, async (f) => {
+        const t = slimThesisForLlm(thesisByName.get(f.name) || {});
+        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score, number 0-100, top_reasons array of 3 strings, gaps array of 2 strings, one_sentence_verdict string. firm_name must be exactly ${JSON.stringify(f.name)}.`;
+        try {
+          const row = await groqJson(one, 'One VC score. JSON only.', true);
+          if (row && (row.alignment_score != null || row.top_reasons)) {
+            return { ...row, firm_name: f.name };
+          }
+        } catch {
+          /* continue */
+        }
+        return {
+          firm_name: f.name,
+          alignment_score: 35,
+          top_reasons: [
+            'Limited thesis text from the fund site — directional match only.',
+            `Sector overlap: ${startupSlim.sector || 'unknown'} vs fund focus.`,
+            'Review fund site and portfolio for a sharper fit read.',
+          ],
+          gaps: ['Thesis extraction may be thin or generic.', 'Stage fit not verified from primary sources.'],
+          one_sentence_verdict: 'Potential fit — confirm with fund materials and warm intro.',
+        };
+      });
+      rankings = perVc;
+    } catch (e2) {
+      failStep('s6', 'Step 6 — Score & rank', esc((e2.message || '').slice(0, 120)));
+      rankings = firms.map((f) => ({
+        firm_name: f.name,
+        alignment_score: 0,
+        top_reasons: ['Scoring step did not complete.'],
+        gaps: ['Try again shortly.'],
+        one_sentence_verdict: 'Weak fit — analysis incomplete.',
+      }));
+    }
   }
   finishStep('s6', 'Step 6 — Score & rank', `${rankings.length} firms scored`);
 
@@ -835,15 +927,16 @@ Rules: one entry per firm in order; verdict must start with Strong fit, Potentia
   let pitchParagraph = '';
   if (topFirm && topThesis) {
     try {
-      const pitchRaw = await groqComplete(
-        `Startup JSON:\n${JSON.stringify(startup).slice(0, 6000)}\n\nVC thesis JSON:\n${JSON.stringify(topThesis).slice(0, 6000)}\n\nWrite ONE paragraph only.`,
+      const pitchRaw = await groqCompleteRetry(
+        `Startup:\n${JSON.stringify(startupSlim)}\n\nVC thesis (compact):\n${JSON.stringify(slimThesisForLlm(topThesis))}\n\nWrite ONE paragraph only.`,
         'You are a startup pitch coach. Based on this VC thesis and this startup, write a single paragraph telling the founder exactly how to reposition pitch messaging to resonate with this VC. Be concrete; reference the VC investment language. No bullet points.',
-        false
+        false,
+        4
       );
       pitchParagraph = pitchRaw.trim();
     } catch {
       pitchParagraph =
-        'The agent could not generate a pitch reframe this run — try again or shorten inputs.';
+        'The agent could not generate a pitch reframe this run — try again in a minute if you hit rate limits.';
     }
   }
   finishStep('s7', 'Step 7 — Pitch reframe', 'Done');
@@ -858,10 +951,14 @@ Rules: one entry per firm in order; verdict must start with Strong fit, Potentia
   addStep('s8', 'Step 8 — Reflect', 'thinking', 'Uncertainty check…');
   let reflect = { uncertainty: '', confidence: 60 };
   try {
+    const rankLine = rankings
+      .map((r) => `${r.firm_name}:${r.alignment_score}`)
+      .join('; ')
+      .slice(0, 900);
     const ref = await groqJson(
-      `Briefly review this VC matching analysis. Startup: ${JSON.stringify(startup).slice(0, 2000)}. Rankings summary: ${JSON.stringify(rankings).slice(0, 4000)}.
-Return JSON: {"biggest_uncertainty":"","confidence_0_to_100":70}
-biggest_uncertainty: one short paragraph max.`,
+      `Startup sector/stage: ${startupSlim.sector} / ${startupSlim.stage}. Scores: ${rankLine}.
+Return JSON only: {"biggest_uncertainty":"","confidence_0_to_100":70}
+biggest_uncertainty = one short paragraph on the single biggest uncertainty in these scores.`,
       'JSON only.',
       true
     );
@@ -870,8 +967,22 @@ biggest_uncertainty: one short paragraph max.`,
       confidence: Math.min(100, Math.max(0, Number(ref.confidence_0_to_100) || 60)),
     };
   } catch {
-    reflect.uncertainty =
-      'Reflection step did not return structured output; treat scores as directional only.';
+    try {
+      const txt = await groqCompleteRetry(
+        `In 2-3 sentences, what is the biggest weakness of using scraped VC homepages to score fit for ${startupSlim.company_name}? Then on a new line write CONFIDENCE:NN (0-100).`,
+        'Be concise.',
+        false,
+        3
+      );
+      const m = txt.match(/CONFIDENCE:\s*(\d+)/i);
+      reflect = {
+        uncertainty: txt.replace(/\s*CONFIDENCE:\s*\d+\s*$/i, '').trim(),
+        confidence: m ? Math.min(100, Math.max(0, parseInt(m[1], 10))) : 55,
+      };
+    } catch {
+      reflect.uncertainty =
+        'Treat rankings as directional: thesis text is often thin and discovery may use a fallback fund list.';
+    }
   }
   finishStep('s8', 'Step 8 — Reflect', `Confidence ${reflect.confidence}/100`);
 
