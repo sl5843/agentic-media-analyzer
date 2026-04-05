@@ -1,6 +1,7 @@
 /**
  * OpenAI-compatible chat completions via Groq (free tier friendly).
- * Env: GROQ_API_KEY (required), GROQ_MODEL (optional, default llama-3.3-70b-versatile)
+ * Env: GROQ_API_KEY (required), GRO_MODEL (optional).
+ * Default 8B: much higher daily token cap than 70B on free tier (~100k TPD for 70B). Override with GROQ_MODEL.
  */
 module.exports = async (req, res) => {
   res.setHeader('Content-Type', 'application/json');
@@ -17,7 +18,7 @@ module.exports = async (req, res) => {
     });
   }
 
-  const defaultModel = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+  const defaultModel = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
   const payload = typeof req.body === 'string' ? safeJson(req.body) : req.body;
   if (!payload || !Array.isArray(payload.messages)) {
     return res.status(400).json({ error: 'Expected JSON body with messages[]' });
@@ -28,7 +29,10 @@ module.exports = async (req, res) => {
     model,
     messages: payload.messages,
     temperature: typeof payload.temperature === 'number' ? payload.temperature : 0.35,
-    max_tokens: typeof payload.max_tokens === 'number' ? payload.max_tokens : 8192,
+    max_tokens:
+      typeof payload.max_tokens === 'number'
+        ? Math.min(payload.max_tokens, 8192)
+        : 4096,
   };
   if (payload.response_format) {
     out.response_format = payload.response_format;
