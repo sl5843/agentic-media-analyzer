@@ -94,6 +94,22 @@
     }
     .slow-opt input { margin-top: 0.2rem; flex-shrink: 0; }
 
+    .input-hints {
+      margin-top: 0.65rem;
+      font-size: 0.82rem;
+      color: var(--muted);
+      max-width: 52rem;
+    }
+    .input-hints summary {
+      cursor: pointer;
+      color: var(--accent);
+    }
+    .input-hints ul {
+      margin: 0.45rem 0 0 1.1rem;
+      padding: 0;
+    }
+    .input-hints li { margin-bottom: 0.35rem; }
+
     .layout {
       display: grid;
       grid-template-columns: minmax(300px, 380px) 1fr;
@@ -304,6 +320,14 @@
         <textarea id="text-input" placeholder="Or paste raw text / social post / transcript here (skips fetch)"></textarea>
         <button type="button" id="run-btn">Run agent</button>
       </div>
+      <details class="input-hints">
+        <summary>What works best (URL or paste)</summary>
+        <ul>
+          <li><strong>Strong:</strong> Long-form tech/business articles, sector trend pieces, product or market analyses, research summaries — clear topic for search and VC matching.</li>
+          <li><strong>Fine:</strong> News pieces about companies or policies. The VC section scores <em>themes and sectors</em> in the story against each fund (not “your startup”), unless the text is clearly a pitch or memo.</li>
+          <li><strong>Weaker:</strong> Very short posts, paywalled pages the fetch can’t read, or content with no real subject (random threads).</li>
+        </ul>
+      </details>
       <div class="input-row options-row">
         <label class="slow-opt">
           <input type="checkbox" id="slow-pace" checked />
@@ -1456,6 +1480,7 @@ Max 3 firms; fewer if results are thin.`;
   if (vcFirms.length) {
     addStep('vc-score', 'SCORE: alignment vs each VC thesis…', 'thinking');
     const scorePack = {
+      inputKind: inputType || 'unknown',
       articleExcerpt: samplePrimaryForModel(primaryContent, 6000),
       firms: vcFirms.map((f) => ({
         name: f.name,
@@ -1463,16 +1488,20 @@ Max 3 firms; fewer if results are thin.`;
         thesis: f.thesis,
       })),
     };
-    const scoreTask = `You are a startup advisor. Score how well the ARTICLE (excerpt) aligns with each VC firm's investment thesis on a scale of 1-100.
+    const scoreTask = `You are an investment analyst. Score how the CONTENT excerpt relates to each VC firm's thesis (1-100).
+
+CONTENT SHAPE (use inputKind as a weak hint):
+- Journalism, industry analysis, or news about third parties: score THEMATIC alignment — sectors, problems, and market dynamics in the piece vs what the fund invests in. Do NOT invent a fictional startup, do NOT use "our company," and do NOT treat the article as a fundraising deck unless it clearly is one.
+- Memo, product page, or founder narrative: you may reference company/founder fit explicitly.
+
 For each firm provide:
 - alignmentScore (1-100)
-- topReasons (exactly 3 strings: strongest alignment points)
-- gaps (exactly 2 strings: mismatches or risks for this fund)
-- pitchAngle (one sentence pitch angle tailored to this specific firm)
-Be specific; reference actual thesis language from the JSON.
+- topReasons (exactly 3 strings): specific links between excerpt and the thesis JSON (reference thesis language where possible)
+- gaps (exactly 2 strings): real mismatches or pass reasons
+- pitchAngle (one sentence): For news/analysis — how a founder operating IN THIS SPACE might frame a conversation with this fund, OR why this story matters for the fund's mandate. For an actual pitch — one tailored angle to this firm. Never say "our" unless the excerpt is clearly first-person from a company.
 
 Return JSON only: {"scores":[{"firmName":"","website":"","alignmentScore":0,"topReasons":["","",""],"gaps":["",""],"pitchAngle":""}]}
-Use the same firm order as input. firmName must match.`;
+Same firm order as input; firmName must match.`;
     try {
       const scoreRaw = await analyzeWithGemini(JSON.stringify(scorePack), scoreTask, {
         temperature: 0.25,
@@ -1738,6 +1767,8 @@ Use keys exactly: sentiment, reflection.`;
 
 For vcDiscovery / vcAlignmentScores / vcReflect: if no VC research ran, use query "" and empty arrays plus empty strings. Otherwise echo the VC context faithfully (you may tighten wording but keep scores and firm names).
 
+If the primary source is news or analysis about third parties, write the executive summary and themes as journalism coverage — do not imply the author is fundraising from the VCs unless the text is a pitch or memo.
+
 Context:
 - Input type: ${inputType}
 - Primary excerpt: ${samplePrimaryForModel(primaryContent, 4500)}
@@ -1966,7 +1997,9 @@ function renderFinalReport(reportJson, ctx) {
                   gaps.map((g) => '<li>' + esc(g) + '</li>').join('') +
                   '</ul>'
                 : '') +
-              (s.pitchAngle ? '<p><strong>Pitch angle:</strong> ' + esc(s.pitchAngle) + '</p>' : '') +
+              (s.pitchAngle
+                ? '<p><strong>Fund angle:</strong> ' + esc(s.pitchAngle) + '</p>'
+                : '') +
               '</div>'
             );
           })
