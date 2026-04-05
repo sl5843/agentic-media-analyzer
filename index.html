@@ -548,6 +548,79 @@ async function mapPool(items, concurrency, fn) {
   return results;
 }
 
+/** VC homepages lead with nav; sample start + middle + end for thesis extraction. */
+function sampleVcPageText(text, max = 7200) {
+  if (!text || text.length <= max) return text;
+  const head = Math.floor(max * 0.32);
+  const tail = Math.floor(max * 0.32);
+  const midLen = max - head - tail - 30;
+  const midStart = Math.max(head, Math.floor((text.length - midLen) / 2));
+  return (
+    text.slice(0, head) +
+    '\n[…]\n' +
+    text.slice(midStart, midStart + midLen) +
+    '\n[…]\n' +
+    text.slice(-tail)
+  );
+}
+
+/**
+ * Thesis extraction: sequential-friendly, retries, JSON mode then plain JSON parse.
+ * Parallel Groq bursts often return 429 on free tier → 0 profiles.
+ */
+async function extractVcThesis(pageText, firmName) {
+  const chunk = sampleVcPageText(pageText, 7000);
+  const nameLit = JSON.stringify(firmName);
+  const user = `Firm name (exact): ${nameLit}
+
+Website text:
+${chunk}
+
+Return ONE JSON object with these keys only (all strings except notable_portfolio):
+- firm_name (exactly ${nameLit})
+- stage_focus
+- sector_focus
+- founder_signals
+- product_signals
+- themes_or_trends (one string; comma-separate themes if needed)
+- notable_portfolio (JSON array of up to 8 company name strings, or [])
+
+If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
+
+  const sys = 'You extract VC investment thesis from website copy. Valid JSON only.';
+
+  try {
+    const o = await groqJson(user, sys, true);
+    if (o && typeof o === 'object') {
+      const has =
+        [o.sector_focus, o.stage_focus, o.founder_signals, o.product_signals, o.themes_or_trends].some(
+          (x) => String(x || '').trim().length > 4
+        );
+      if (has) return { ...o, firm_name: o.firm_name || firmName };
+    }
+  } catch {
+    /* try plain completion */
+  }
+
+  try {
+    const raw = await groqCompleteRetry(
+      user +
+        '\n\nReply with a single JSON object only. No markdown fences. No commentary before or after.',
+      sys,
+      false,
+      4
+    );
+    const o = parseJsonLoose(raw);
+    if (o && typeof o === 'object') {
+      return { ...o, firm_name: o.firm_name || firmName };
+    }
+  } catch {
+    /* ignore */
+  }
+
+  return null;
+}
+
 async function groqJson(userContent, systemHint, strictRetry = true) {
   let raw = await groqCompleteRetry(userContent, systemHint, true);
   let parsed = parseJsonLoose(raw);
@@ -769,34 +842,28 @@ Websites must be the fund's own domain.`;
     `${okFetched.length}/${firms.length} loaded`
   );
 
-  addStep('s5', 'Step 5 — Extract VC theses (parallel)', 'thinking', '5× Groq in parallel…');
-  const thesisTask = `Extract this VC firm's investment thesis as JSON:
-- firm_name
-- stage_focus
-- sector_focus
-- founder_signals (what they look for in founders)
-- product_signals (what they look for in products)
-- themes_or_trends (string or array)
-- notable_portfolio (array of company names, max 8, or empty)
-
-If the page is thin, infer cautiously from navigation/about and mark uncertainty in sector_focus.`;
-
+  addStep(
+    's5',
+    'Step 5 — Extract VC theses',
+    'thinking',
+    'One fund at a time (avoids Groq 429 on free tier)…'
+  );
   const thesisInputs = fetchResults.filter((r) => r.ok && r.text.length > 50);
-  const thesisList = await mapPool(thesisInputs, 2, async (r) => {
-    try {
-      const data = await groqJson(
-        r.text.slice(0, 10000),
-        thesisTask + '\nReturn JSON only.',
-        true
+  const thesisList = [];
+  for (let i = 0; i < thesisInputs.length; i++) {
+    const r = thesisInputs[i];
+    if (i > 0) await new Promise((res) => setTimeout(res, 700));
+    const data = await extractVcThesis(r.text, r.firm.name);
+    const usable =
+      data &&
+      [data.sector_focus, data.stage_focus, data.founder_signals, data.product_signals, data.themes_or_trends].some(
+        (x) => String(x || '').trim().length > 4
       );
-      return { firm: r.firm, thesis: data, ok: true };
-    } catch {
-      return { firm: r.firm, thesis: null, ok: false };
-    }
-  });
+    thesisList.push({ firm: r.firm, thesis: data, ok: !!usable });
+  }
   finishStep(
     's5',
-    'Step 5 — Extract VC theses (parallel)',
+    'Step 5 — Extract VC theses',
     `${thesisList.filter((t) => t.ok).length} thesis profiles`
   );
 
@@ -820,6 +887,7 @@ If the page is thin, infer cautiously from navigation/about and mark uncertainty
     }
   }
 
+  await new Promise((r) => setTimeout(r, 400));
   addStep('s6', 'Step 6 — Score & rank', 'thinking', 'Analyst pass (compact context)…');
   const startupSlim = slimStartupForLlm(startup);
   const scorePack = {
@@ -926,17 +994,28 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
   addStep('s7', 'Step 7 — Pitch reframe (top VC)', 'thinking', topFirm ? topFirm.firm_name : '—');
   let pitchParagraph = '';
   if (topFirm && topThesis) {
+    const thesisPitchPack = slimThesisForLlm(topThesis);
     try {
       const pitchRaw = await groqCompleteRetry(
-        `Startup:\n${JSON.stringify(startupSlim)}\n\nVC thesis (compact):\n${JSON.stringify(slimThesisForLlm(topThesis))}\n\nWrite ONE paragraph only.`,
+        `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis (compact):\n${JSON.stringify(thesisPitchPack)}\n\nWrite ONE paragraph only.`,
         'You are a startup pitch coach. Based on this VC thesis and this startup, write a single paragraph telling the founder exactly how to reposition pitch messaging to resonate with this VC. Be concrete; reference the VC investment language. No bullet points.',
         false,
         4
       );
       pitchParagraph = pitchRaw.trim();
     } catch {
-      pitchParagraph =
-        'The agent could not generate a pitch reframe this run — try again in a minute if you hit rate limits.';
+      try {
+        const pitchRaw2 = await groqCompleteRetry(
+          `Startup: ${startupSlim.company_name} — ${startupSlim.one_line_description}. Sector: ${startupSlim.sector}. Differentiator: ${startupSlim.key_differentiator}.\n\nInvestor: ${topFirm.firm_name}. Known thesis summary: ${JSON.stringify(thesisPitchPack).slice(0, 1200)}.\n\nOne paragraph: how should the founder angle the pitch for this firm?`,
+          'One short paragraph, no bullets.',
+          false,
+          3
+        );
+        pitchParagraph = pitchRaw2.trim();
+      } catch {
+        pitchParagraph =
+          'Pitch reframe could not be generated (often rate limits). Wait a minute and re-run, or shorten the day’s Groq usage.';
+      }
     }
   }
   finishStep('s7', 'Step 7 — Pitch reframe', 'Done');
