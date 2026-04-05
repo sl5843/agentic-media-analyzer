@@ -303,6 +303,7 @@ const SERP_API_KEY = '';
 
 const API_GROQ = '/api/groq';
 const API_SERPAPI = '/api/serpapi';
+const API_FETCH_PAGE = '/api/fetch-page';
 const ALLORIGINS_GET = 'https://api.allorigins.win/get?url=';
 
 const FALLBACK_VCS = [
@@ -427,6 +428,38 @@ function htmlToText(html) {
   }
 }
 
+function textFromHtmlMaybe(html) {
+  if (!html || typeof html !== 'string') return '';
+  const text = htmlToText(html);
+  return text && text.length >= 120 ? text.slice(0, 80000) : '';
+}
+
+/** Same-origin server fetch first (works on Vercel when browser proxies fail). */
+async function tryServerFetch(url) {
+  const res = await fetch(API_FETCH_PAGE, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  });
+  const data = await res.json().catch(() => ({}));
+  const html = typeof data.html === 'string' ? data.html : '';
+  const t = textFromHtmlMaybe(html);
+  if (t) return t;
+  if (data.ok === false && data.error) throw new Error(data.error);
+  throw new Error(data.error || 'Server fetch returned no usable text');
+}
+
+async function tryCorsProxyIo(url) {
+  const res = await fetch('https://corsproxy.io/?' + encodeURIComponent(url), {
+    headers: { Accept: 'text/html,application/xhtml+xml,*/*' },
+  });
+  if (!res.ok) throw new Error(`corsproxy:${res.status}`);
+  const raw = await res.text();
+  const t = textFromHtmlMaybe(raw);
+  if (!t) throw new Error('corsproxy:short');
+  return t;
+}
+
 async function fetchViaAllOrigins(url) {
   const enc = encodeURIComponent(url);
   const errors = [];
@@ -436,24 +469,57 @@ async function fetchViaAllOrigins(url) {
       const wrap = await res.json();
       const raw = wrap.contents;
       if (typeof raw === 'string') {
-        const text = htmlToText(raw);
-        if (text && text.length >= 120) return text.slice(0, 80000);
+        const t = textFromHtmlMaybe(raw);
+        if (t) return t;
       }
-    } else errors.push(`get:${res.status}`);
+    } else errors.push(`allorigins-get:${res.status}`);
   } catch (e) {
-    errors.push(`get:${e.message}`);
+    errors.push(`allorigins-get:${e.message}`);
   }
   try {
     const res = await fetch(`https://api.allorigins.win/raw?url=${enc}`);
     if (res.ok) {
       const raw = await res.text();
-      const text = htmlToText(raw);
-      if (text && text.length >= 120) return text.slice(0, 80000);
-    } else errors.push(`raw:${res.status}`);
+      const t = textFromHtmlMaybe(raw);
+      if (t) return t;
+    } else errors.push(`allorigins-raw:${res.status}`);
   } catch (e) {
-    errors.push(`raw:${e.message}`);
+    errors.push(`allorigins-raw:${e.message}`);
   }
   throw new Error(errors.join(' | ') || 'Could not load page');
+}
+
+/** Ordered strategies: Vercel server → AllOrigins → corsproxy.io; optional www variant. */
+async function fetchStartupPage(url) {
+  const attempts = [url];
+  try {
+    const u = new URL(url);
+    if (!u.hostname.startsWith('www.')) {
+      attempts.push(`${u.protocol}//www.${u.hostname}${u.pathname}${u.search}`);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  const errs = [];
+  for (const u of attempts) {
+    try {
+      return await tryServerFetch(u);
+    } catch (e) {
+      errs.push(`server:${e.message}`);
+    }
+    try {
+      return await fetchViaAllOrigins(u);
+    } catch (e) {
+      errs.push(String(e.message));
+    }
+    try {
+      return await tryCorsProxyIo(u);
+    } catch (e) {
+      errs.push(String(e.message));
+    }
+  }
+  throw new Error(errs.join(' | ') || 'Could not load page');
 }
 
 async function groqComplete(userContent, systemHint, jsonMode = true) {
@@ -693,7 +759,7 @@ async function runPipeline(startupUrl) {
   addStep('s1', 'Step 1 — Fetch startup', 'thinking', 'Loading site via proxy…');
   let pageText = '';
   try {
-    pageText = await fetchViaAllOrigins(startupUrl);
+    pageText = await fetchStartupPage(startupUrl);
     finishStep('s1', 'Step 1 — Fetch startup', `${pageText.length.toLocaleString()} characters`);
   } catch (e) {
     failStep('s1', 'Step 1 — Fetch startup', 'Could not read that URL; try another page or check the link.');
@@ -828,7 +894,7 @@ Websites must be the fund's own domain.`;
   const fetchResults = await Promise.all(
     firms.map(async (f) => {
       try {
-        const text = await fetchViaAllOrigins(f.website);
+        const text = await fetchStartupPage(f.website);
         return { firm: f, text, ok: true };
       } catch {
         return { firm: f, text: '', ok: false };
