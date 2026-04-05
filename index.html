@@ -522,14 +522,14 @@ async function fetchStartupPage(url) {
   throw new Error(errs.join(' | ') || 'Could not load page');
 }
 
-async function groqComplete(userContent, systemHint, jsonMode = true) {
+async function groqComplete(userContent, systemHint, jsonMode = true, maxTokens = 3072) {
   const body = {
     messages: [
       ...(systemHint ? [{ role: 'system', content: systemHint }] : []),
       { role: 'user', content: userContent },
     ],
     temperature: 0.2,
-    max_tokens: 4096,
+    max_tokens: Math.min(Math.max(256, maxTokens), 8192),
   };
   if (jsonMode) body.response_format = { type: 'json_object' };
 
@@ -551,7 +551,13 @@ async function groqComplete(userContent, systemHint, jsonMode = true) {
   return String(text);
 }
 
-async function groqCompleteRetry(userContent, systemHint, jsonMode = true, maxAttempts = 4) {
+async function groqCompleteRetry(
+  userContent,
+  systemHint,
+  jsonMode = true,
+  maxAttempts = 4,
+  maxTokens = 3072
+) {
   let lastErr;
   for (let a = 0; a < maxAttempts; a++) {
     try {
@@ -559,11 +565,13 @@ async function groqCompleteRetry(userContent, systemHint, jsonMode = true, maxAt
         const wait = 900 * a * a + Math.random() * 400;
         await new Promise((r) => setTimeout(r, wait));
       }
-      return await groqComplete(userContent, systemHint, jsonMode);
+      return await groqComplete(userContent, systemHint, jsonMode, maxTokens);
     } catch (e) {
       lastErr = e;
       const msg = e.message || '';
-      if (!/429|rate|limit|token/i.test(msg) || a === maxAttempts - 1) throw e;
+      const retryable =
+        /429|rate|limit|token|too large|TPM|message size/i.test(msg) && a < maxAttempts - 1;
+      if (!retryable) throw e;
     }
   }
   throw lastErr;
@@ -614,8 +622,8 @@ async function mapPool(items, concurrency, fn) {
   return results;
 }
 
-/** VC homepages lead with nav; sample start + middle + end for thesis extraction. */
-function sampleVcPageText(text, max = 7200) {
+/** Long pages + long prompts exceed Groq 8B free TPM (~6k); keep excerpts compact. */
+function sampleVcPageText(text, max = 5200) {
   if (!text || text.length <= max) return text;
   const head = Math.floor(max * 0.32);
   const tail = Math.floor(max * 0.32);
@@ -635,7 +643,7 @@ function sampleVcPageText(text, max = 7200) {
  * Parallel Groq bursts often return 429 on free tier → 0 profiles.
  */
 async function extractVcThesis(pageText, firmName) {
-  const chunk = sampleVcPageText(pageText, 7000);
+  const chunk = sampleVcPageText(pageText, 4800);
   const nameLit = JSON.stringify(firmName);
   const user = `Firm name (exact): ${nameLit}
 
@@ -656,7 +664,7 @@ If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
   const sys = 'You extract VC investment thesis from website copy. Valid JSON only.';
 
   try {
-    const o = await groqJson(user, sys, true);
+    const o = await groqJson(user, sys, true, 2048);
     if (o && typeof o === 'object') {
       const has =
         [o.sector_focus, o.stage_focus, o.founder_signals, o.product_signals, o.themes_or_trends].some(
@@ -674,7 +682,8 @@ If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
         '\n\nReply with a single JSON object only. No markdown fences. No commentary before or after.',
       sys,
       false,
-      4
+      4,
+      2048
     );
     const o = parseJsonLoose(raw);
     if (o && typeof o === 'object') {
@@ -687,8 +696,8 @@ If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
   return null;
 }
 
-async function groqJson(userContent, systemHint, strictRetry = true) {
-  let raw = await groqCompleteRetry(userContent, systemHint, true);
+async function groqJson(userContent, systemHint, strictRetry = true, maxTokens = 3072) {
+  let raw = await groqCompleteRetry(userContent, systemHint, true, 4, maxTokens);
   let parsed = parseJsonLoose(raw);
   if (parsed && typeof parsed === 'object') return parsed;
   if (strictRetry) {
@@ -697,7 +706,8 @@ async function groqJson(userContent, systemHint, strictRetry = true) {
         '\n\nYour previous reply was not valid JSON. Reply with ONE valid JSON object only, minified, no markdown.',
       'Output only a single JSON object. No prose.',
       true,
-      3
+      3,
+      maxTokens
     );
     parsed = parseJsonLoose(raw);
     if (parsed && typeof parsed === 'object') return parsed;
@@ -769,29 +779,37 @@ async function runPipeline(startupUrl) {
   }
 
   addStep('s2', 'Step 2 — Analyze startup', 'thinking', 'Structured profile via Groq…');
-  const analyzePrompt = `From this startup website text, extract JSON with keys:
-- company_name
-- one_line_description
-- sector (specific, not just "AI")
-- stage (one of: pre-seed, seed, series-a, unknown)
-- business_model (e.g. b2b, b2c, marketplace, devtools)
-- key_differentiator
-- target_customer
-- traction_signals (string or array of strings)
-- founding_team_signals (string or array of strings, or empty if unknown)
+  const analyzeIntro = `From the website excerpt, return JSON with keys: company_name, one_line_description, sector (specific), stage (pre-seed|seed|series-a|unknown), business_model, key_differentiator, target_customer, traction_signals (string or array), founding_team_signals (string or array). Use unknown or "" if missing.
 
-Website text:\n${pageText.slice(0, 14000)}`;
+Excerpt:
+`;
 
   let startup;
-  try {
-    startup = await groqJson(
-      analyzePrompt,
-      'You extract accurate startup facts from marketing sites. Use unknown when unclear. JSON only.'
+  const tryAnalyze = (maxChars) =>
+    groqJson(
+      analyzeIntro + sampleVcPageText(pageText, maxChars),
+      'Accurate startup facts from marketing sites. JSON only.',
+      true,
+      1536
     );
+
+  try {
+    startup = await tryAnalyze(3200);
   } catch (e) {
-    failStep('s2', 'Step 2 — Analyze startup', 'Groq could not parse startup profile.');
-    appendSection(`<h2>Analysis paused</h2><p class="evidence">${esc(e.message)}</p>`);
-    return;
+    const msg = e.message || '';
+    if (/too large|TPM|message size|7629|6000/i.test(msg)) {
+      try {
+        startup = await tryAnalyze(1800);
+      } catch (e2) {
+        failStep('s2', 'Step 2 — Analyze startup', 'Groq quota or prompt size — try again in a minute.');
+        appendSection(`<h2>Analysis paused</h2><p class="evidence">${esc(e2.message)}</p>`);
+        return;
+      }
+    } else {
+      failStep('s2', 'Step 2 — Analyze startup', 'Groq could not parse startup profile.');
+      appendSection(`<h2>Analysis paused</h2><p class="evidence">${esc(msg)}</p>`);
+      return;
+    }
   }
   finishStep(
     's2',
@@ -840,11 +858,11 @@ Website text:\n${pageText.slice(0, 14000)}`;
   if (!usedFallback) {
     const serpPack = JSON.stringify(
       organic.slice(0, 10).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
-    ).slice(0, 12000);
+    ).slice(0, 7000);
     const pickPrompt = `From these Google results, list exactly 5 distinct venture capital firms or funds (not portfolio companies, not news sites). JSON: {"firms":[{"name":"","website":"https://..."}]}
 Websites must be the fund's own domain.`;
     try {
-      const picked = await groqJson(serpPack + '\n\nQuery: ' + searchQ, pickPrompt);
+      const picked = await groqJson(serpPack + '\n\nQuery: ' + searchQ, pickPrompt, true, 1536);
       const arr = Array.isArray(picked?.firms) ? picked.firms : [];
       const seen = new Set();
       for (const f of arr) {
@@ -966,14 +984,14 @@ Websites must be the fund's own domain.`;
 
   const scorePrompt = `You are a senior venture analyst. Score how well this startup aligns with each VC firm's thesis (1-100).
 
-${JSON.stringify(scorePack)}
+${JSON.stringify(scorePack).slice(0, 12000)}
 
 Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"top_reasons":["","",""],"gaps":["",""],"one_sentence_verdict":""}]}
 Rules: exactly one ranking per VC above in the same order; verdict must start with Strong fit, Potential fit, or Weak fit; cite thesis language; no generic fluff.`;
 
   let rankings = [];
   try {
-    const scored = await groqJson(scorePrompt, 'JSON only. Valid rankings array.', true);
+    const scored = await groqJson(scorePrompt, 'JSON only. Valid rankings array.', true, 3072);
     rankings = Array.isArray(scored?.rankings) ? scored.rankings : [];
   } catch (e) {
     /* bulk score failed — use per-VC below */
@@ -985,7 +1003,7 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
         const t = slimThesisForLlm(thesisByName.get(f.name) || {});
         const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score, number 0-100, top_reasons array of 3 strings, gaps array of 2 strings, one_sentence_verdict string. firm_name must be exactly ${JSON.stringify(f.name)}.`;
         try {
-          const row = await groqJson(one, 'One VC score. JSON only.', true);
+          const row = await groqJson(one, 'One VC score. JSON only.', true, 2048);
           if (row && (row.alignment_score != null || row.top_reasons)) {
             return { ...row, firm_name: f.name };
           }
@@ -1066,7 +1084,8 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
         `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis (compact):\n${JSON.stringify(thesisPitchPack)}\n\nWrite ONE paragraph only.`,
         'You are a startup pitch coach. Based on this VC thesis and this startup, write a single paragraph telling the founder exactly how to reposition pitch messaging to resonate with this VC. Be concrete; reference the VC investment language. No bullet points.',
         false,
-        4
+        4,
+        768
       );
       pitchParagraph = pitchRaw.trim();
     } catch {
@@ -1075,7 +1094,8 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
           `Startup: ${startupSlim.company_name} — ${startupSlim.one_line_description}. Sector: ${startupSlim.sector}. Differentiator: ${startupSlim.key_differentiator}.\n\nInvestor: ${topFirm.firm_name}. Known thesis summary: ${JSON.stringify(thesisPitchPack).slice(0, 1200)}.\n\nOne paragraph: how should the founder angle the pitch for this firm?`,
           'One short paragraph, no bullets.',
           false,
-          3
+          3,
+          640
         );
         pitchParagraph = pitchRaw2.trim();
       } catch {
@@ -1105,7 +1125,8 @@ Rules: exactly one ranking per VC above in the same order; verdict must start wi
 Return JSON only: {"biggest_uncertainty":"","confidence_0_to_100":70}
 biggest_uncertainty = one short paragraph on the single biggest uncertainty in these scores.`,
       'JSON only.',
-      true
+      true,
+      1024
     );
     reflect = {
       uncertainty: ref.biggest_uncertainty || '',
@@ -1117,7 +1138,8 @@ biggest_uncertainty = one short paragraph on the single biggest uncertainty in t
         `In 2-3 sentences, what is the biggest weakness of using scraped VC homepages to score fit for ${startupSlim.company_name}? Then on a new line write CONFIDENCE:NN (0-100).`,
         'Be concise.',
         false,
-        3
+        3,
+        512
       );
       const m = txt.match(/CONFIDENCE:\s*(\d+)/i);
       reflect = {
