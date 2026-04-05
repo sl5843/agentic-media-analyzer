@@ -308,7 +308,7 @@
         <label class="slow-opt">
           <input type="checkbox" id="slow-pace" checked />
           <span
-            ><strong>Slower API pacing</strong> (on by default): waits several seconds between each model call so free-tier <abbr title="tokens per minute">TPM</abbr>/<abbr title="requests per minute">RPM</abbr> limits are less likely to trip. Runs take longer but usually fewer 429 errors. Uncheck for fastest runs if your quota allows.</span
+            ><strong>Slower API pacing</strong> (on by default): waits a few seconds <em>after each</em> model response. A full URL run does <strong>many</strong> steps (plan, VC thesis × firms, scoring, related pages, compare, sentiment, final report) — so <strong>roughly 2–8 minutes</strong> is normal, not a hang. Uncheck for the fastest runs if your API tier can handle bursts; you may see more 429s. Also: with this on, starting a second run within 40s of the last one is blocked on purpose (cooldown).</span
           >
         </label>
       </div>
@@ -370,7 +370,7 @@ function afterLlmSuccessGapMs() {
   if (!state.slowPace) {
     return state.llmBackend === 'groq' ? 800 : 600;
   }
-  return state.llmBackend === 'groq' ? 6500 : 4000;
+  return state.llmBackend === 'groq' ? 4500 : 3500;
 }
 
 function logReasoning(line) {
