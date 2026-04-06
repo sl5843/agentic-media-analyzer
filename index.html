@@ -825,6 +825,36 @@ function thesisDigestLineIsNoise(v) {
   return /^unknown(\s*·\s*unknown)+$/i.test(t);
 }
 
+/** Extraction said “nav only” or equivalent — not fair to show as a VC card. */
+function isThesisExtractionGarbage(raw) {
+  if (!raw || typeof raw !== 'object') return true;
+  const sec = String(raw.sector_focus || '').trim().toLowerCase();
+  if (
+    /mostly\s*navigation|^navigation\s*$|^nav\s*$|^site\s+is\s+mostly|^homepage\s+is\s+mostly/i.test(sec) ||
+    (/^[^.]{0,40}navigation[^.]{0,20}$/i.test(sec) && String(raw.product_signals || '').trim().length < 8)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function thesisWorthShowingInUi(raw) {
+  if (!raw || raw._thin) return false;
+  if (!thesisDataSubstantive(raw)) return false;
+  if (isThesisExtractionGarbage(raw)) return false;
+  return true;
+}
+
+/** Omit low-signal rows so the report stays credible (user request: don’t list “empty” VCs). */
+function shouldShowVcCard(r, thesisByName) {
+  if (r.unscorable) return false;
+  if (!thesisWorthShowingInUi(thesisByName.get(r.firm_name))) return false;
+  const score = Math.min(100, Math.max(0, Number(r.alignment_score) || 0));
+  const v = String(r.one_sentence_verdict || '').toLowerCase();
+  if (score <= 0 && v.includes('weak')) return false;
+  return true;
+}
+
 /**
  * Thesis extraction: sequential-friendly, retries, JSON mode then plain JSON parse.
  * Parallel Groq bursts often return 429 on free tier → 0 profiles.
@@ -1784,23 +1814,29 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
     return (b.alignment_score || 0) - (a.alignment_score || 0);
   });
   rankings = rankings.map(normalizeRankingRow);
+
+  const rankingsForDisplay = rankings.filter((r) => shouldShowVcCard(r, thesisByName));
+  const omittedFromReport = rankings.length - rankingsForDisplay.length;
   {
-    const scoredN = rankings.filter((r) => !r.unscorable).length;
-    const thinN = rankings.length - scoredN;
-    finishStep(
-      's6',
-      'Step 6 — Score & rank',
-      thinN ? `${scoredN} scored, ${thinN} insufficient data` : `${scoredN} scored`
-    );
+    const parts = [`${rankingsForDisplay.length} in report`];
+    if (omittedFromReport > 0) parts.push(`${omittedFromReport} omitted (thin/unusable thesis or not shown)`);
+    finishStep('s6', 'Step 6 — Score & rank', parts.join(' · '));
   }
 
   let vcCardsHtml = '<h2>VC match rankings</h2>';
   if (serpDiscoveryFailed) {
     vcCardsHtml += '<p class="evidence">SerpAPI had no results, so discovery started from the curated fund list.</p>';
   }
-  const firstScorableIdx = rankings.findIndex((r) => !r.unscorable);
-  vcCardsHtml += '<div class="vc-grid">';
-  rankings.forEach((r, idx) => {
+  if (omittedFromReport > 0) {
+    vcCardsHtml +=
+      '<p class="evidence">Funds with no usable thesis on their homepage, insufficient data, or a 0 weak-fit score are omitted so the list stays actionable.</p>';
+  }
+  if (rankingsForDisplay.length === 0) {
+    vcCardsHtml +=
+      '<p class="evidence">Nothing to show — discovery returned only thin homepages or unusable extractions. Re-run, paste a URL, or try another batch of funds.</p>';
+  } else {
+    vcCardsHtml += '<div class="vc-grid">';
+  rankingsForDisplay.forEach((r, idx) => {
     const scoreNum = r.unscorable ? null : Math.min(100, Math.max(0, Number(r.alignment_score) || 0));
     const scoreDisplay = r.unscorable ? '—' : String(scoreNum);
     const barTarget = r.unscorable ? 0 : scoreNum;
@@ -1808,7 +1844,7 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
     const gaps = (r.gaps || []).slice(0, 2);
     const verdict = r.one_sentence_verdict || 'Potential fit — review thesis.';
     const verdictShort = verdict.split('—')[0].trim();
-    const top = firstScorableIdx >= 0 ? idx === firstScorableIdx : idx === 0;
+    const top = idx === 0;
     vcCardsHtml += `
       <div class="vc-card${top ? ' top-rank' : ''}${r.unscorable ? ' unscorable' : ''}" data-rank="${idx}">
         <div class="vc-card-head">
@@ -1833,13 +1869,14 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
       </div>`;
   });
   vcCardsHtml += '</div>';
+  }
   const vcSection = appendSection(vcCardsHtml);
   vcSection.querySelectorAll('.score-fill').forEach((el) => {
     const t = parseInt(el.getAttribute('data-target'), 10) || 0;
     animateScoreBar(el, t);
   });
 
-  const topFirm = rankings.find((r) => !r.unscorable) || null;
+  const topFirm = rankingsForDisplay[0] || null;
   const topThesis = topFirm ? thesisByName.get(topFirm.firm_name) : null;
 
   addStep('s7', 'Step 7 — Pitch reframe (top VC)', 'thinking', topFirm ? topFirm.firm_name : '—');
@@ -1886,7 +1923,9 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
     }
   } else if (!topFirm) {
     pitchBodyHtml = `<p>${esc(
-      'No fund had enough thesis text to tailor a pitch. Improve VC site fetch success in Step 4, or pick an investor and paste their thesis manually.'
+      rankingsForDisplay.length === 0
+        ? 'Every discovered fund was omitted from the report (homepage too thin or unusable thesis). Re-run, try another URL, or analyze a specific investor site with more copy.'
+        : 'No fund had enough thesis text to tailor a pitch. Improve VC site fetch success in Step 4, or pick an investor and paste their thesis manually.'
     )}</p>`;
   }
   finishStep('s7', 'Step 7 — Pitch reframe', 'Done');
@@ -1901,7 +1940,7 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
   addStep('s8', 'Step 8 — Reflect', 'thinking', 'Uncertainty check…');
   let reflect = { uncertainty: '', confidence: 60 };
   try {
-    const rankLine = rankings
+    const rankLine = (rankingsForDisplay.length ? rankingsForDisplay : rankings)
       .map((r) => `${r.firm_name}:${r.unscorable ? 'N/A' : r.alignment_score}`)
       .join('; ')
       .slice(0, 900);
