@@ -341,9 +341,9 @@
   <div class="wrap">
     <header>
       <h1>Startup Signal Scorer</h1>
-      <p>Single autonomous agent — paste <strong>one startup URL</strong>, click <strong>Analyze</strong>. Uses <strong>Groq</strong> via <code>/api/groq</code> and SerpAPI for VC discovery.</p>
+      <p>Single autonomous agent — paste a <strong>homepage URL</strong> or type a <strong>company name</strong> (name lookup uses the same SerpAPI key as VC discovery), then <strong>Analyze</strong>. Uses <strong>Groq</strong> via <code>/api/groq</code>.</p>
       <div class="input-row">
-        <input type="url" id="url-input" placeholder="https://your-startup.com" autocomplete="off" />
+        <input type="text" id="url-input" placeholder="https://notion.so or Notion" autocomplete="off" spellcheck="false" />
         <button type="button" id="run-btn">Analyze</button>
       </div>
     </header>
@@ -356,7 +356,7 @@
       <div class="panel">
         <div class="panel-head">Live results</div>
         <div id="report-area">
-          <p class="placeholder" id="report-placeholder">Enter a startup homepage URL to see the snapshot and VC match rankings as each step finishes.</p>
+          <p class="placeholder" id="report-placeholder">Enter a startup URL or company name to see the snapshot and VC match rankings as each step finishes.</p>
           <div id="live-sections" style="display:none;"></div>
         </div>
       </div>
@@ -913,6 +913,75 @@ async function serpApiSearch(q) {
   return res.json();
 }
 
+/** If it looks like a real URL (has a domain), use it; otherwise treat input as a company name. */
+function parseStartupInput(raw) {
+  const t = String(raw || '').trim();
+  if (!t) return { kind: 'empty' };
+  const withScheme = /^https?:\/\//i.test(t) ? t : `https://${t}`;
+  try {
+    const u = new URL(withScheme);
+    const host = u.hostname.replace(/^www\./, '');
+    const tld = host.split('.').pop() || '';
+    if (
+      (u.protocol === 'http:' || u.protocol === 'https:') &&
+      host.includes('.') &&
+      tld.length >= 2 &&
+      !/\s/.test(t)
+    ) {
+      return { kind: 'url', url: u.href };
+    }
+  } catch {
+    /* company name */
+  }
+  return { kind: 'name', name: t };
+}
+
+function serpLinkLooksLikeJunkHomepage(link) {
+  try {
+    const host = new URL(link).hostname.replace(/^www\./, '').toLowerCase();
+    return /(^|\.)wikipedia\.org$|^(linkedin|crunchbase|facebook|twitter|x|youtube|instagram)\.com$/.test(host);
+  } catch {
+    return true;
+  }
+}
+
+/** Serp + Groq pick official site — still fetches real HTML afterward (grounding), same as pasting a URL. */
+async function resolveStartupUrlFromName(companyQuery) {
+  const serp = await serpApiSearch(`${companyQuery.trim()} official website`);
+  if (!serp.configured || serp.serpapi_error || !Array.isArray(serp.organic_results) || serp.organic_results.length === 0) {
+    return null;
+  }
+  const pack = serp.organic_results
+    .slice(0, 12)
+    .map((o) => ({
+      title: o.title,
+      link: o.link,
+      snippet: String(o.snippet || '').slice(0, 220),
+    }))
+    .filter((o) => /^https:\/\//i.test(String(o.link || '')) && !serpLinkLooksLikeJunkHomepage(o.link));
+  if (pack.length === 0) {
+    const fb = serp.organic_results.find((o) => /^https:\/\//i.test(String(o.link || '')));
+    return fb ? fb.link : null;
+  }
+  const nameLit = JSON.stringify(companyQuery.trim());
+  try {
+    const picked = await groqJson(
+      JSON.stringify(pack.slice(0, 8)) +
+        `\n\nUser entered this startup name: ${nameLit}.\nReturn JSON only: {"url":"https://..."}\nurl = that company’s official product/marketing homepage. Not Wikipedia, Crunchbase, news-only pages, or social profiles. Prefer the canonical consumer/product site.`,
+      'JSON only. One https URL.',
+      true,
+      512
+    );
+    let u = String(picked?.url || '').trim();
+    if (!/^https?:\/\//i.test(u)) u = `https://${u}`;
+    const parsed = new URL(u);
+    if (parsed.hostname.includes('.')) return parsed.href;
+  } catch {
+    /* use first filtered result */
+  }
+  return pack[0].link;
+}
+
 function showLiveSections() {
   document.getElementById('report-placeholder').style.display = 'none';
   document.getElementById('live-sections').style.display = 'block';
@@ -1280,7 +1349,7 @@ function normalizeRankingRow(r) {
   };
 }
 
-async function runPipeline(startupUrl) {
+async function runPipeline(startupUrl, resolveNote = '') {
   state.stepEls.clear();
   document.getElementById('agent-log').innerHTML = '';
   document.getElementById('live-sections').innerHTML = '';
@@ -1288,6 +1357,11 @@ async function runPipeline(startupUrl) {
   document.getElementById('report-placeholder').style.display = 'block';
 
   let userNote = '';
+
+  if (resolveNote) {
+    addStep('s0', 'Step 0 — Resolve company name', 'thinking', 'SerpAPI + pick homepage…');
+    finishStep('s0', 'Step 0 — Resolve company name', resolveNote.slice(0, 160));
+  }
 
   addStep('s1', 'Step 1 — Fetch startup', 'thinking', 'Loading site via proxy…');
   let pageText = '';
@@ -1414,6 +1488,11 @@ Excerpt:
       ${icpBlock}${surfaceBlock}${compBlock}${tractionBlock}${foundersBlock}
       ${skimHtml}
       ${oqBlock}
+      <p class="evidence" style="margin-top:0.65rem">${
+        resolveNote
+          ? `Name lookup: ${esc(resolveNote)} · page fetched: <code>${esc(startupUrl)}</code>`
+          : `Page fetched: <code>${esc(startupUrl)}</code>`
+      }</p>
     </div>`;
   appendSection(snapHtml);
 
@@ -1876,17 +1955,42 @@ biggest_uncertainty = one short paragraph on methodology limits (thin homepages,
 }
 
 document.getElementById('run-btn').addEventListener('click', async () => {
-  const urlInput = document.getElementById('url-input').value.trim();
+  const rawInput = document.getElementById('url-input').value.trim();
   const btn = document.getElementById('run-btn');
-  if (!urlInput) {
-    alert('Paste a startup URL.');
+  if (!rawInput) {
+    alert('Paste a startup URL or type a company name.');
     return;
   }
-  try {
-    new URL(urlInput);
-  } catch {
-    alert('Enter a valid URL including https://');
+
+  const parsed = parseStartupInput(rawInput);
+  if (parsed.kind === 'empty') {
+    alert('Paste a startup URL or type a company name.');
     return;
+  }
+
+  let startupUrl;
+  let resolveNote = '';
+  if (parsed.kind === 'url') {
+    startupUrl = parsed.url;
+  } else {
+    btn.disabled = true;
+    let resolved;
+    try {
+      resolved = await resolveStartupUrlFromName(parsed.name);
+    } catch (e) {
+      btn.disabled = false;
+      alert(String(e.message || 'Could not look up that name.'));
+      return;
+    }
+    btn.disabled = false;
+    if (!resolved) {
+      alert(
+        'Could not resolve a homepage from that name. Paste the full URL (e.g. https://notion.so), or configure SerpAPI (same key as VC discovery) for name search.'
+      );
+      return;
+    }
+    startupUrl = resolved;
+    resolveNote = `${parsed.name} → ${resolved.replace(/^https?:\/\//i, '')}`;
   }
 
   btn.disabled = true;
@@ -1897,7 +2001,7 @@ document.getElementById('run-btn').addEventListener('click', async () => {
       btn.disabled = false;
       return;
     }
-    await runPipeline(urlInput);
+    await runPipeline(startupUrl, resolveNote);
   } catch (e) {
     document.getElementById('report-placeholder').style.display = 'none';
     showLiveSections();
