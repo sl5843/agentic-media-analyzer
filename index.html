@@ -372,6 +372,46 @@ const API_SERPAPI = '/api/serpapi';
 const API_FETCH_PAGE = '/api/fetch-page';
 const ALLORIGINS_GET = 'https://api.allorigins.win/get?url=';
 
+/**
+ * Helicone-class deals (LLM observability / production-AI instrumentation) at growth or Series A:
+ * pin Sequoia, Khosla, Benchmark, Accel, NEA to the front of discovery — not generic “any AI” startups.
+ */
+const HELICONE_LIKE_TIER1_PRIORITY_VCS = [
+  { name: 'Sequoia Capital', website: 'https://www.sequoiacap.com/' },
+  { name: 'Khosla Ventures', website: 'https://www.khoslaventures.com/' },
+  { name: 'Benchmark', website: 'https://www.benchmark.com/' },
+  { name: 'Accel', website: 'https://www.accel.com/' },
+  { name: 'NEA', website: 'https://www.nea.com/' },
+];
+
+const HELICONE_LIKE_TIER1_HOSTS = new Set(
+  HELICONE_LIKE_TIER1_PRIORITY_VCS.map((f) => {
+    try {
+      return new URL(f.website).hostname.replace(/^www\./, '').toLowerCase();
+    } catch {
+      return '';
+    }
+  }).filter(Boolean)
+);
+
+/** After Groq re-order, keep tier-1 funds at the front for fetch when Helicone-like profile matches. */
+function boostHeliconeLikeTier1FundsToFront(pool, startupSlim) {
+  if (!startupIsHeliconeLikeForTier1Vcs(startupSlim) || !Array.isArray(pool) || pool.length < 2) return pool;
+  const head = [];
+  const tail = [];
+  for (const f of pool) {
+    let h = '';
+    try {
+      h = new URL(String(f?.website || '')).hostname.replace(/^www\./, '').toLowerCase();
+    } catch {
+      /* skip */
+    }
+    if (h && HELICONE_LIKE_TIER1_HOSTS.has(h)) head.push(f);
+    else tail.push(f);
+  }
+  return head.length ? [...head, ...tail] : pool;
+}
+
 const FALLBACK_VCS = [
   { name: 'Y Combinator', website: 'https://www.ycombinator.com/' },
   { name: 'First Round Capital', website: 'https://www.firstround.com/' },
@@ -882,6 +922,10 @@ async function orderCandidatePoolForStartup(pool, startupSlim) {
   const max = Math.min(14, pool.length);
   const slice = pool.slice(0, max);
   const idxPack = slice.map((f, i) => ({ i, name: f.name, website: f.website }));
+  const helLike = startupIsHeliconeLikeForTier1Vcs(startupSlim);
+  const priorityHint = helLike
+    ? '\n\nWhen Sequoia Capital, Khosla Ventures, Benchmark, Accel, or NEA appear in this list, rank them near the TOP (after obvious sector fit) — this startup matches a Helicone-style profile (LLM / production-AI observability, logging, or instrumentation).'
+    : '';
   const prompt = `Order VC funds by plausible fit for THIS startup. You only have names and domains — use common knowledge lightly; deprioritize obviously narrow mismatches.
 
 Startup:
@@ -896,7 +940,7 @@ ${JSON.stringify({
 Funds (index i must appear exactly once in output):
 ${JSON.stringify(idxPack)}
 
-Return JSON only: {"order":[...]} — permutation of indices 0..${max - 1}, BEST plausible fit first. Put dedicated life-sciences/biotech-only funds LAST for enterprise software / devtools / horizontal SaaS without healthcare in the startup JSON. Put crypto-native funds LAST unless the startup is clearly web3/fintech-crypto.`;
+Return JSON only: {"order":[...]} — permutation of indices 0..${max - 1}, BEST plausible fit first. Put dedicated life-sciences/biotech-only funds LAST for enterprise software / devtools / horizontal SaaS without healthcare in the startup JSON. Put crypto-native funds LAST unless the startup is clearly web3/fintech-crypto.${priorityHint}`;
 
   try {
     const o = await groqJson(prompt, 'JSON only: {"order": number[]}. Every index 0..n-1 exactly once.', true, 900);
@@ -1182,6 +1226,47 @@ function thesisStartupSectorClash(thesisRaw, startupSlim) {
   return false;
 }
 
+/**
+ * Helicone-style deal: growth or Series A + (named Helicone OR LLM/production-AI observability & instrumentation).
+ * Drives tier-1 VC pin + stricter thesis swap — not every generic AI infra startup.
+ */
+function startupIsHeliconeLikeForTier1Vcs(startupSlim) {
+  if (!startupSlim || typeof startupSlim !== 'object') return false;
+  const stage = String(startupSlim.stage || '')
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, ' ');
+  if (!/^(growth|series a)$/.test(stage)) return false;
+  const cn = String(startupSlim.company_name || '').toLowerCase();
+  const blob = `${startupSlim.sector || ''} ${startupSlim.one_line_description || ''} ${startupSlim.key_differentiator || ''} ${startupSlim.competitive_angle || ''} ${startupSlim.icp_summary || ''} ${startupSlim.target_customer || ''}`.toLowerCase();
+  if (/\bhelicone\b/.test(cn) || /\bhelicone\b/.test(blob)) return true;
+  return /\b(langsmith|llm\s*observ|llm\s*ops|llmops|observability.*\b(llm|prompt|inference|generative)\b|\b(llm|prompt|inference|generative)\b.*\b(observ|trace|log|monitor|debug)|multi[- ]step\s*llm|log(ging)?\s+(llm|prompt|inference|requests?|api)|trace(s)?\s+(llm|prompt|request)|monitor(ing)?\s+(llm|production\s+ai|inference)|visuali[sz]e.*\b(llm|prompt)|instrumentation.*\b(llm|prompt|inference))\b/i.test(
+    blob
+  );
+}
+
+/**
+ * For Helicone-like profiles: thesis must show software/AI/infra-relevant mandate, not e.g. pure bio with no tech overlap.
+ * Used to skip bad Serp matches — swap for the next pool candidate instead of scoring a hollow fit.
+ */
+function thesisLacksHeliconeLikeRelevance(thesisRaw, startupSlim) {
+  if (!thesisRaw || !startupIsHeliconeLikeForTier1Vcs(startupSlim)) return false;
+  if (thesisStartupSectorClash(thesisRaw, startupSlim)) return true;
+  const blob = `${thesisRaw.sector_focus || ''} ${thesisRaw.themes_or_trends || ''} ${thesisRaw.product_signals || ''} ${thesisRaw.founder_signals || ''}`.toLowerCase();
+  const t = blob.replace(/\s+/g, ' ').trim();
+  if (t.length < 14) return true;
+  const re =
+    /\b(ai\b|artificial intelligence|machine learning|\bml\b|large language|llm|generative|software|saas|developer|infrastructure|infra\b|data stack|cloud|platform|open source|b2b|enterprise|api\b|technology companies)\b/i;
+  return !re.test(t);
+}
+
+function thesisNeedsReplacementInLineup(thesisRaw, startupSlim) {
+  if (!thesisDataSubstantive(thesisRaw)) return true;
+  if (isThesisExtractionGarbage(thesisRaw)) return true;
+  if (thesisLacksHeliconeLikeRelevance(thesisRaw, startupSlim)) return true;
+  return false;
+}
+
 /** Omit low-signal rows so the report stays credible (user request: don’t list “empty” VCs). */
 function shouldShowVcCard(r, thesisByName, startupSlim) {
   if (r.unscorable) return false;
@@ -1202,6 +1287,15 @@ function shouldShowVcCard(r, thesisByName, startupSlim) {
     startupSlim &&
     thesisStartupSectorClash(thesisByName.get(r.firm_name), startupSlim) &&
     score < 42
+  ) {
+    return false;
+  }
+
+  if (
+    startupSlim &&
+    startupIsHeliconeLikeForTier1Vcs(startupSlim) &&
+    thesisLacksHeliconeLikeRelevance(thesisByName.get(r.firm_name), startupSlim) &&
+    score < 58
   ) {
     return false;
   }
@@ -2238,11 +2332,16 @@ Excerpt:
     finishStep('s3', 'Step 3 — Discover VCs', 'Using curated seed-stage VC list');
   }
 
+  const startupSlim = slimStartupForLlm(startup);
+
   let groqPicks = [];
   if (organic.length > 0) {
     const serpPack = JSON.stringify(
       organic.slice(0, 12).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
     ).slice(0, 7500);
+    const helPickHint = startupIsHeliconeLikeForTier1Vcs(startupSlim)
+      ? '\n\nThis startup matches a HELICONE-STYLE profile (growth/Series A, LLM or production-AI observability, logging, tracing, or instrumentation — e.g. Helicone, LangSmith-class tooling): strongly prefer funds with a clear software / AI / infra mandate. If a result is a fund with no plausible AI/software/infra thesis, OMIT it and use the next relevant result instead. When Sequoia Capital, Khosla Ventures, Benchmark, Accel, or NEA appear in the search results with valid fund domains, rank them among the TOP picks.'
+      : '';
     const pickPrompt = `Startup being evaluated (for relevance only — do NOT list this company as a VC):
 ${JSON.stringify({
       company_name: startup.company_name,
@@ -2253,7 +2352,7 @@ ${JSON.stringify({
 
 From these Google results, list up to 10 distinct venture capital firms or funds (not portfolio companies, not news sites). JSON: {"firms":[{"name":"","website":"https://..."}]}
 ORDER firms with the STRONGEST plausible sector/stage fit for this startup FIRST. Omit or do not include funds that are clearly dedicated to an unrelated vertical (e.g. pure biotechnology / life-science funds for horizontal B2B SaaS or devtools with no healthcare angle in the startup JSON).
-Websites must be the fund's own domain. Return as many solid funds as you can (aim for 8–10) so there are alternates if some sites fail to load or thesis text is thin.`;
+Websites must be the fund's own domain. Return as many solid funds as you can (aim for 8–10) so there are alternates if some sites fail to load or thesis text is thin.${helPickHint}`;
     try {
       const picked = await groqJson(serpPack + '\n\nQuery: ' + searchQ, pickPrompt, true, 1536);
       const arr = Array.isArray(picked?.firms) ? picked.firms : [];
@@ -2279,10 +2378,12 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     }
   }
 
-  const startupSlim = slimStartupForLlm(startup);
-
-  let candidatePool = mergeCandidatePool(groqPicks, FALLBACK_VCS);
+  const primaryFromSerp = startupIsHeliconeLikeForTier1Vcs(startupSlim)
+    ? mergeCandidatePool(HELICONE_LIKE_TIER1_PRIORITY_VCS, groqPicks)
+    : groqPicks;
+  let candidatePool = mergeCandidatePool(primaryFromSerp, FALLBACK_VCS);
   candidatePool = await orderCandidatePoolForStartup(candidatePool, startupSlim);
+  candidatePool = boostHeliconeLikeTier1FundsToFront(candidatePool, startupSlim);
 
   addStep(
     's4',
@@ -2383,12 +2484,12 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     let bfR = 0;
     while (bfR < 24) {
       bfR++;
-      const strongN = fetchResults.filter((r) =>
-        thesisDataSubstantive(thesisByName.get(r.firm.name))
+      const strongN = fetchResults.filter(
+        (r) => !thesisNeedsReplacementInLineup(thesisByName.get(r.firm.name), startupSlim)
       ).length;
       if (strongN >= lineupTarget) break;
-      const weakIdx = fetchResults.findIndex(
-        (r) => !thesisDataSubstantive(thesisByName.get(r.firm.name))
+      const weakIdx = fetchResults.findIndex((r) =>
+        thesisNeedsReplacementInLineup(thesisByName.get(r.firm.name), startupSlim)
       );
       if (weakIdx < 0) break;
       const repl = pickThesisReplacementFirm();
@@ -2401,7 +2502,8 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
         const text = await fetchStartupPage(repl.website);
         if (!text || text.length < 50) continue;
         const data = await extractVcThesis(text, repl.name);
-        if (!data || !thesisDataSubstantive(data)) continue;
+        if (!data || !thesisDataSubstantive(data) || isThesisExtractionGarbage(data)) continue;
+        if (thesisLacksHeliconeLikeRelevance(data, startupSlim)) continue;
         thesisByName.delete(oldFirm.name);
         if (oldH) usedForLineup.delete(oldH);
         usedForLineup.add(firmHostFromFirm(repl));
