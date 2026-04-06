@@ -372,46 +372,6 @@ const API_SERPAPI = '/api/serpapi';
 const API_FETCH_PAGE = '/api/fetch-page';
 const ALLORIGINS_GET = 'https://api.allorigins.win/get?url=';
 
-/**
- * Helicone-class deals (LLM observability / production-AI instrumentation) at growth or Series A:
- * pin Sequoia, Khosla, Benchmark, Accel, NEA to the front of discovery — not generic “any AI” startups.
- */
-const HELICONE_LIKE_TIER1_PRIORITY_VCS = [
-  { name: 'Sequoia Capital', website: 'https://www.sequoiacap.com/' },
-  { name: 'Khosla Ventures', website: 'https://www.khoslaventures.com/' },
-  { name: 'Benchmark', website: 'https://www.benchmark.com/' },
-  { name: 'Accel', website: 'https://www.accel.com/' },
-  { name: 'NEA', website: 'https://www.nea.com/' },
-];
-
-const HELICONE_LIKE_TIER1_HOSTS = new Set(
-  HELICONE_LIKE_TIER1_PRIORITY_VCS.map((f) => {
-    try {
-      return new URL(f.website).hostname.replace(/^www\./, '').toLowerCase();
-    } catch {
-      return '';
-    }
-  }).filter(Boolean)
-);
-
-/** After Groq re-order, keep tier-1 funds at the front for fetch when Helicone-like profile matches. */
-function boostHeliconeLikeTier1FundsToFront(pool, startupSlim) {
-  if (!startupIsHeliconeLikeForTier1Vcs(startupSlim) || !Array.isArray(pool) || pool.length < 2) return pool;
-  const head = [];
-  const tail = [];
-  for (const f of pool) {
-    let h = '';
-    try {
-      h = new URL(String(f?.website || '')).hostname.replace(/^www\./, '').toLowerCase();
-    } catch {
-      /* skip */
-    }
-    if (h && HELICONE_LIKE_TIER1_HOSTS.has(h)) head.push(f);
-    else tail.push(f);
-  }
-  return head.length ? [...head, ...tail] : pool;
-}
-
 const FALLBACK_VCS = [
   { name: 'Y Combinator', website: 'https://www.ycombinator.com/' },
   { name: 'First Round Capital', website: 'https://www.firstround.com/' },
@@ -922,9 +882,9 @@ async function orderCandidatePoolForStartup(pool, startupSlim) {
   const max = Math.min(14, pool.length);
   const slice = pool.slice(0, max);
   const idxPack = slice.map((f, i) => ({ i, name: f.name, website: f.website }));
-  const helLike = startupIsHeliconeLikeForTier1Vcs(startupSlim);
-  const priorityHint = helLike
-    ? '\n\nWhen Sequoia Capital, Khosla Ventures, Benchmark, Accel, or NEA appear in this list, rank them near the TOP (after obvious sector fit) — this startup matches a Helicone-style profile (LLM / production-AI observability, logging, or instrumentation).'
+  const llmObsGrowth = startupIsHeliconeLikeProfile(startupSlim);
+  const priorityHint = llmObsGrowth
+    ? '\n\nThis startup is growth-stage LLM / production-AI observability or instrumentation (logging, tracing, evals). Rank funds whose names/domains plausibly invest in B2B software, AI infrastructure, or developer tools ahead of narrow vertical or non-tech mandates when fit is ambiguous.'
     : '';
   const prompt = `Order VC funds by plausible fit for THIS startup. You only have names and domains — use common knowledge lightly; deprioritize obviously narrow mismatches.
 
@@ -1227,10 +1187,10 @@ function thesisStartupSectorClash(thesisRaw, startupSlim) {
 }
 
 /**
- * Helicone-style deal: growth or Series A + (named Helicone OR LLM/production-AI observability & instrumentation).
- * Drives tier-1 VC pin + stricter thesis swap — not every generic AI infra startup.
+ * Growth/Series A + LLM/production-AI observability or instrumentation — used only to tighten thesis swap
+ * and Serp ordering hints (no hardcoded fund list).
  */
-function startupIsHeliconeLikeForTier1Vcs(startupSlim) {
+function startupIsHeliconeLikeProfile(startupSlim) {
   if (!startupSlim || typeof startupSlim !== 'object') return false;
   const stage = String(startupSlim.stage || '')
     .trim()
@@ -1246,11 +1206,11 @@ function startupIsHeliconeLikeForTier1Vcs(startupSlim) {
 }
 
 /**
- * For Helicone-like profiles: thesis must show software/AI/infra-relevant mandate, not e.g. pure bio with no tech overlap.
+ * For LLM-observability growth profiles: thesis must show software/AI/infra-relevant mandate, not e.g. pure bio with no tech overlap.
  * Used to skip bad Serp matches — swap for the next pool candidate instead of scoring a hollow fit.
  */
-function thesisLacksHeliconeLikeRelevance(thesisRaw, startupSlim) {
-  if (!thesisRaw || !startupIsHeliconeLikeForTier1Vcs(startupSlim)) return false;
+function thesisLacksLlmObsMandateMatch(thesisRaw, startupSlim) {
+  if (!thesisRaw || !startupIsHeliconeLikeProfile(startupSlim)) return false;
   if (thesisStartupSectorClash(thesisRaw, startupSlim)) return true;
   const blob = `${thesisRaw.sector_focus || ''} ${thesisRaw.themes_or_trends || ''} ${thesisRaw.product_signals || ''} ${thesisRaw.founder_signals || ''}`.toLowerCase();
   const t = blob.replace(/\s+/g, ' ').trim();
@@ -1263,7 +1223,7 @@ function thesisLacksHeliconeLikeRelevance(thesisRaw, startupSlim) {
 function thesisNeedsReplacementInLineup(thesisRaw, startupSlim) {
   if (!thesisDataSubstantive(thesisRaw)) return true;
   if (isThesisExtractionGarbage(thesisRaw)) return true;
-  if (thesisLacksHeliconeLikeRelevance(thesisRaw, startupSlim)) return true;
+  if (thesisLacksLlmObsMandateMatch(thesisRaw, startupSlim)) return true;
   return false;
 }
 
@@ -1293,8 +1253,8 @@ function shouldShowVcCard(r, thesisByName, startupSlim) {
 
   if (
     startupSlim &&
-    startupIsHeliconeLikeForTier1Vcs(startupSlim) &&
-    thesisLacksHeliconeLikeRelevance(thesisByName.get(r.firm_name), startupSlim) &&
+    startupIsHeliconeLikeProfile(startupSlim) &&
+    thesisLacksLlmObsMandateMatch(thesisByName.get(r.firm_name), startupSlim) &&
     score < 58
   ) {
     return false;
@@ -2339,8 +2299,8 @@ Excerpt:
     const serpPack = JSON.stringify(
       organic.slice(0, 12).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
     ).slice(0, 7500);
-    const helPickHint = startupIsHeliconeLikeForTier1Vcs(startupSlim)
-      ? '\n\nThis startup matches a HELICONE-STYLE profile (growth/Series A, LLM or production-AI observability, logging, tracing, or instrumentation — e.g. Helicone, LangSmith-class tooling): strongly prefer funds with a clear software / AI / infra mandate. If a result is a fund with no plausible AI/software/infra thesis, OMIT it and use the next relevant result instead. When Sequoia Capital, Khosla Ventures, Benchmark, Accel, or NEA appear in the search results with valid fund domains, rank them among the TOP picks.'
+    const helPickHint = startupIsHeliconeLikeProfile(startupSlim)
+      ? '\n\nThis startup is growth/Series A LLM or production-AI observability, logging, tracing, or instrumentation. Prefer funds with a clear software / AI / infra / developer-tools mandate. Omit results that are clearly unrelated (e.g. no plausible tech thesis). Do not treat any specific firm names as mandatory — order by fit to this profile from the search results only.'
       : '';
     const pickPrompt = `Startup being evaluated (for relevance only — do NOT list this company as a VC):
 ${JSON.stringify({
@@ -2378,12 +2338,8 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     }
   }
 
-  const primaryFromSerp = startupIsHeliconeLikeForTier1Vcs(startupSlim)
-    ? mergeCandidatePool(HELICONE_LIKE_TIER1_PRIORITY_VCS, groqPicks)
-    : groqPicks;
-  let candidatePool = mergeCandidatePool(primaryFromSerp, FALLBACK_VCS);
+  let candidatePool = mergeCandidatePool(groqPicks, FALLBACK_VCS);
   candidatePool = await orderCandidatePoolForStartup(candidatePool, startupSlim);
-  candidatePool = boostHeliconeLikeTier1FundsToFront(candidatePool, startupSlim);
 
   addStep(
     's4',
@@ -2503,7 +2459,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
         if (!text || text.length < 50) continue;
         const data = await extractVcThesis(text, repl.name);
         if (!data || !thesisDataSubstantive(data) || isThesisExtractionGarbage(data)) continue;
-        if (thesisLacksHeliconeLikeRelevance(data, startupSlim)) continue;
+        if (thesisLacksLlmObsMandateMatch(data, startupSlim)) continue;
         thesisByName.delete(oldFirm.name);
         if (oldH) usedForLineup.delete(oldH);
         usedForLineup.add(firmHostFromFirm(repl));
