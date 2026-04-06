@@ -1556,27 +1556,54 @@ function pitchOpeningTooCloseToTagline(hook, startupSlim) {
   return false;
 }
 
-/** One sentence: startup wedge + VC thesis hook (not the website tagline). */
-function buildThesisLedOpeningSentence(startupSlim, vcFirmName, thesisPack) {
-  const vc = String(vcFirmName || 'this fund').trim();
-  const cn = String(startupSlim.company_name || 'We').trim();
+/** True if opening starts with fund name or “For [Fund]…”. */
+function pitchOpeningLeadsWithVcFirm(hook, vcFirmName) {
+  const h = String(hook || '').trim();
+  const v = String(vcFirmName || '').trim();
+  if (!h || !v) return false;
+  const esc = v.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (new RegExp(`^${esc}\\b`, 'i').test(h)) return true;
+  if (new RegExp(`^for\\s+${esc}\\b`, 'i').test(h)) return true;
+  return false;
+}
+
+/**
+ * One sharp sentence: value proposition first, then tie to thesis themes from JSON.
+ * Never names the fund or describes what kind of investor they are.
+ */
+function buildThesisLedOpeningSentence(startupSlim, _vcFirmName, thesisPack) {
   const rawChip = String(
-    thesisPack?.themes_or_trends || thesisPack?.sector_focus || thesisPack?.product_signals || ''
+    thesisPack?.themes_or_trends ||
+      thesisPack?.sector_focus ||
+      thesisPack?.product_signals ||
+      thesisPack?.stage_focus ||
+      ''
   ).trim();
   const chipPick =
     rawChip
       .split(/[;,•]/)
       .map((x) => x.trim())
-      .filter(Boolean)[0] || 'their stated mandate';
-  const chip = chipPick.slice(0, 110);
+      .filter(Boolean)[0] || 'sector, stage, and product themes in the thesis excerpt';
+  const chip = chipPick.slice(0, 96);
+
+  const ol = String(startupSlim.one_line_description || '').trim();
+  const kd = String(startupSlim.key_differentiator || '').trim();
+  const ca = String(startupSlim.competitive_angle || '').trim();
   const ps = String(startupSlim.product_surface || '').trim();
   const icp = String(startupSlim.icp_summary || startupSlim.target_customer || '').trim();
-  const wedge =
-    String(startupSlim.competitive_angle || '').trim() ||
-    (ps && icp ? `${ps} for ${icp}` : ps || icp) ||
-    String(startupSlim.key_differentiator || '').slice(0, 130);
-  const w = wedge || 'the product story in the profile';
-  return `${cn} delivers ${w}, aligning with ${vc}’s focus on ${chip}.`.replace(/\s+/g, ' ').slice(0, 340);
+
+  let valueLead = kd || ca;
+  if (!valueLead && ps && icp) valueLead = `${ps} for ${icp.slice(0, 100)}`;
+  else if (!valueLead && icp) valueLead = `${ps ? `${ps} ` : ''}for ${icp.slice(0, 100)}`.trim();
+  else if (!valueLead) valueLead = ps || ol.slice(0, 160) || 'the core product capability in this profile';
+
+  let vl = valueLead.trim();
+  vl = vl.charAt(0).toUpperCase() + vl.slice(1);
+  if (vl.endsWith('.')) vl = vl.slice(0, -1);
+
+  return `${vl}, matching the ${chip} emphasis in the thesis materials you're reviewing.`
+    .replace(/\s+/g, ' ')
+    .slice(0, 340);
 }
 
 /** Collapse near-duplicate gap lines (same mismatch stated twice). */
@@ -1719,7 +1746,7 @@ function sanitizePitchParagraph(text, startupSlim, vcFirmName) {
   const kept = parts.filter((s) => moneyFragmentsSupported(s, corpusLower) && properNounsSupported(s, corpusLower));
   if (kept.length === 0) {
     return (
-      'Lead with company name, one_line_description, and key_differentiator from the JSON; map each to the closest thesis theme string from the VC pack.'
+      'Lead with key_differentiator and target customer from the JSON, then connect to the closest thesis theme strings—do not open with the fund name.'
     );
   }
   return kept.join(' ');
@@ -1773,7 +1800,11 @@ function sanitizeStructuredPitch(obj, startupSlim, vcFirmName, thesisPack) {
   ).toLowerCase()}`;
   let hook = sanitizeFreeText(String(obj?.opening_hook || ''), corpusLower);
   hook = scrubPitchOpeningHype(hook, startupSlim, vcFirmName, thesisPack);
-  if (!String(hook || '').trim() || pitchOpeningTooCloseToTagline(hook, startupSlim)) {
+  if (
+    !String(hook || '').trim() ||
+    pitchOpeningTooCloseToTagline(hook, startupSlim) ||
+    pitchOpeningLeadsWithVcFirm(hook, vcFirmName)
+  ) {
     hook = buildThesisLedOpeningSentence(startupSlim, vcFirmName, thesisPack);
     hook = sanitizeFreeText(hook, corpusLower) || hook;
   }
@@ -2508,10 +2539,6 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
   if (serpDiscoveryFailed) {
     vcCardsHtml += '<p class="evidence">SerpAPI had no results, so discovery started from the curated fund list.</p>';
   }
-  if (omittedFromReport > 0) {
-    vcCardsHtml +=
-      '<p class="evidence">Some funds were omitted: thin thesis, off-sector match with a low score, weak 0 score, or placeholder-only reasons. Discovery order is startup-aware; re-run for a different Serp draw if the list was noisy.</p>';
-  }
   if (rankingsForDisplay.length === 0) {
     vcCardsHtml +=
       '<p class="evidence">Nothing to show — the loaded fund was omitted (often off-sector vs your profile or unusable thesis), or the page could not be scored. Re-run to reshuffle discovery, or start from a different company query.</p>';
@@ -2564,12 +2591,16 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
   let pitchBodyHtml = '';
   if (topFirm && topThesis) {
     const thesisPitchPack = slimThesisForLlm(topThesis);
-    const pitchJsonUser = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis:\n${JSON.stringify(thesisPitchPack)}\n\nReturn JSON only with keys: opening_hook (string, EXACTLY ONE sentence), thesis_bridge (string, 3–5 sentences), proof_points (array of exactly 3 non-empty strings; each line must cite ONLY facts from Startup JSON), diligence_gaps (array of exactly 2 non-empty strings).\n\nopening_hook rules (critical):\n- ONE sentence only.\n- Do NOT repeat, copy, or paraphrase one_line_description or the website tagline.\n- Must connect (a) a specific startup capability from competitive_angle, product_surface, icp_summary, or traction_signals to (b) a specific string from Thesis JSON (themes_or_trends, sector_focus, product_signals, or stage_focus). Name the VC once and the startup once.\n\nthesis_bridge: Each sentence pairs one Startup JSON field with one Thesis field by name. At least two pairings.\nproof_points: Three factual clauses from Startup JSON (no named_investors unless pitching that list).\ndiligence_gaps: Two sharp product or GTM questions.\n\nRules: no revenue, customer names, funding rounds, or geographies unless they appear in the Startup JSON. No hype unless verbatim in Startup JSON.`;
+    const pitchJsonUser = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis:\n${JSON.stringify(thesisPitchPack)}\n\nReturn JSON only with keys: opening_hook (string, EXACTLY ONE sentence), thesis_bridge (string, 3–5 sentences), proof_points (array of exactly 3 non-empty strings; each line must cite ONLY facts from Startup JSON), diligence_gaps (array of exactly 2 non-empty strings).\n\nopening_hook rules (critical):\n- ONE sharp sentence only.\n- START with the startup’s concrete value proposition: who it serves and what outcome or capability it delivers. Pull from key_differentiator, competitive_angle, product_surface, icp_summary, target_customer, traction_signals before falling back to one_line_description.\n- In the same sentence, tie that proposition to specific language from Thesis JSON (themes_or_trends, sector_focus, product_signals, stage_focus).\n- Do NOT begin with the VC firm’s name. Do NOT use “For [Fund]…”, “At [Fund]…”, or “[Fund] invests…”. Do NOT name the fund in opening_hook at all—they already know who they are.\n- Do NOT describe what kind of fund they are or their business model (“seed-stage firm”, “we back founders”, etc.); only use thesis-field phrases as the investor hook.\n- Do NOT repeat, copy, or closely paraphrase the website tagline alone.\n\nthesis_bridge: Each sentence pairs one Startup JSON field with one Thesis field by name. At least two pairings.\nproof_points: Three factual clauses from Startup JSON (no named_investors unless pitching that list).\ndiligence_gaps: Two sharp product or GTM questions.\n\nRules: no revenue, customer names, funding rounds, or geographies unless they appear in the Startup JSON. No hype unless verbatim in Startup JSON.`;
     try {
       const po = await groqJson(pitchJsonUser, 'JSON only.', true, 2048);
       let cleaned = sanitizeStructuredPitch(po, startupSlim, topFirm.firm_name, thesisPitchPack);
       let oh = isDisclaimerLine(cleaned.opening_hook) ? '' : cleaned.opening_hook;
-      if (!String(oh || '').trim() || pitchOpeningTooCloseToTagline(oh, startupSlim)) {
+      if (
+        !String(oh || '').trim() ||
+        pitchOpeningTooCloseToTagline(oh, startupSlim) ||
+        pitchOpeningLeadsWithVcFirm(oh, topFirm.firm_name)
+      ) {
         oh = buildThesisLedOpeningSentence(startupSlim, topFirm.firm_name, thesisPitchPack);
       }
       cleaned = {
@@ -2589,7 +2620,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
       try {
         const pitchRaw = await groqCompleteRetry(
           `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis (compact):\n${JSON.stringify(thesisPitchPack)}\n\nWrite ONE paragraph only.`,
-          'You are a startup pitch coach. Use ONLY facts in the Startup JSON. One paragraph: connect a concrete startup capability (not the tagline alone) to this VC’s thesis themes. No bullet points.',
+          'You are a startup pitch coach. Use ONLY facts in the Startup JSON. One paragraph: open with the startup’s value proposition, then connect to this VC’s thesis themes. Do not open with the fund’s name or describe what kind of fund they are. No bullet points.',
           false,
           4,
           768
@@ -2598,7 +2629,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
       } catch {
         try {
           const pitchRaw2 = await groqCompleteRetry(
-            `Startup: ${startupSlim.company_name} — ${startupSlim.one_line_description}. Sector: ${startupSlim.sector}. Differentiator: ${startupSlim.key_differentiator}.\n\nInvestor: ${topFirm.firm_name}. Known thesis summary: ${JSON.stringify(thesisPitchPack).slice(0, 1200)}.\n\nOne paragraph: how should the founder angle the pitch for this firm? Do not invent metrics or customers not listed above.`,
+            `Startup: ${startupSlim.company_name} — ${startupSlim.one_line_description}. Sector: ${startupSlim.sector}. Differentiator: ${startupSlim.key_differentiator}.\n\nInvestor: ${topFirm.firm_name}. Known thesis summary: ${JSON.stringify(thesisPitchPack).slice(0, 1200)}.\n\nOne paragraph: lead with the startup value proposition, then map to the thesis summary. Do not open with the investor’s name or describe what kind of fund they are. Do not invent metrics or customers not listed above.`,
             'One short paragraph, no bullets. Facts only from the startup line above.',
             false,
             3,
