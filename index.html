@@ -341,7 +341,7 @@
   <div class="wrap">
     <header>
       <h1>Startup Signal Scorer</h1>
-      <p>Single autonomous agent — paste a <strong>homepage URL</strong> or type a <strong>company name</strong> (name lookup uses the same SerpAPI key as VC discovery), then <strong>Analyze</strong>. Picks <strong>one</strong> best-matching fund to fetch, score, and pitch. Uses <strong>Groq</strong> via <code>/api/groq</code>.</p>
+      <p>Single autonomous agent — paste a <strong>homepage URL</strong> or type a <strong>company name</strong> (name lookup uses the same SerpAPI key as VC discovery), then <strong>Analyze</strong>. Loads up to <strong>two</strong> funds for comparison; a <strong>second</strong> fetch and thesis pass run only if the first match is weak or omitted (saves Groq quota). Uses <strong>Groq</strong> via <code>/api/groq</code>.</p>
       <div class="input-row">
         <input type="text" id="url-input" placeholder="https://notion.so or Notion" autocomplete="off" spellcheck="false" />
         <button type="button" id="run-btn">Analyze</button>
@@ -356,7 +356,7 @@
       <div class="panel">
         <div class="panel-head">Live results</div>
         <div id="report-area">
-          <p class="placeholder" id="report-placeholder">Enter a startup URL or company name to see the snapshot and a single top VC match as each step finishes.</p>
+          <p class="placeholder" id="report-placeholder">Enter a startup URL or company name to see the snapshot and up to two VC matches as each step finishes.</p>
           <div id="live-sections" style="display:none;"></div>
         </div>
       </div>
@@ -385,8 +385,10 @@ const FALLBACK_VCS = [
   { name: 'Antler', website: 'https://www.antler.co/' },
 ];
 
-/** VC funds to fetch, extract theses for, and score (lower = faster). Single match = sharper report. */
-const VC_TARGET_COUNT = 1;
+/** Max VC funds after full pipeline (second is lazy — see LAZY_SECOND_MIN_SCORE). */
+const VC_MAX_FUNDS = 2;
+/** If the first fund passes the card gate and scores at or above this, skip loading a second fund. */
+const LAZY_SECOND_MIN_SCORE = 45;
 
 const state = { stepEls: new Map(), groqOk: false };
 
@@ -705,7 +707,7 @@ async function mapPool(items, concurrency, fn) {
 
 /**
  * Re-order Serp+fallback candidates so the first successful fetch is more likely to fit the startup
- * (reduces “random biotech fund” for a SaaS company when VC_TARGET_COUNT is 1).
+ * (reduces “random biotech fund” for a SaaS company when only one slot is filled first).
  */
 async function orderCandidatePoolForStartup(pool, startupSlim) {
   if (!Array.isArray(pool) || pool.length <= 1) return pool;
@@ -771,9 +773,24 @@ function mergeCandidatePool(primaryFirms, fallbackList) {
  * Fetch VC homepages in parallel waves; skip failed hosts and pull more from pool until `target`
  * successes or the pool is exhausted (so Serp picks that 404 are replaced by alts, not “insufficient” slots).
  */
-async function fetchVcPagesWithBackfill(pool, target) {
+async function fetchVcPagesWithBackfill(pool, target, continuation = null) {
   const triedHosts = new Set();
   const okRows = [];
+  if (continuation?.triedHosts) {
+    for (const h of continuation.triedHosts) triedHosts.add(h);
+  }
+  if (continuation?.existingRows?.length) {
+    for (const r of continuation.existingRows) {
+      okRows.push(r);
+      let h = '';
+      try {
+        h = new URL(r.firm.website).hostname.replace(/^www\./, '');
+      } catch {
+        /* ignore */
+      }
+      if (h) triedHosts.add(h);
+    }
+  }
 
   async function fetchOne(f) {
     let h = '';
@@ -808,19 +825,22 @@ async function fetchVcPagesWithBackfill(pool, target) {
     return batch;
   }
 
-  let batch = peekNextFirms(target);
-  let batchResults = (await Promise.all(batch.map((f) => fetchOne(f)))).filter(Boolean);
-  okRows.push(...batchResults.filter((r) => r.ok));
-
-  while (okRows.length < target) {
-    const need = target - okRows.length;
-    batch = peekNextFirms(Math.min(need + 3, 8));
-    if (batch.length === 0) break;
-    batchResults = (await Promise.all(batch.map((f) => fetchOne(f)))).filter(Boolean);
+  if (okRows.length < target) {
+    const firstBatchN = continuation ? Math.min(target - okRows.length + 3, 8) : target;
+    let batch = peekNextFirms(firstBatchN);
+    let batchResults = (await Promise.all(batch.map((f) => fetchOne(f)))).filter(Boolean);
     okRows.push(...batchResults.filter((r) => r.ok));
   }
 
-  return { rows: okRows.slice(0, target), hostsAttempted: triedHosts.size };
+  while (okRows.length < target) {
+    const need = target - okRows.length;
+    const batch = peekNextFirms(Math.min(need + 3, 8));
+    if (batch.length === 0) break;
+    const batchResults = (await Promise.all(batch.map((f) => fetchOne(f)))).filter(Boolean);
+    okRows.push(...batchResults.filter((r) => r.ok));
+  }
+
+  return { rows: okRows.slice(0, target), hostsAttempted: triedHosts.size, triedHosts };
 }
 
 /** Long pages + long prompts exceed Groq 8B free TPM (~6k); keep excerpts compact. */
@@ -1671,6 +1691,102 @@ function normalizeRankingRow(r) {
   };
 }
 
+async function scoreRankingsPipeline(fetchResults, thesisByName, startupSlim) {
+  const firms = fetchResults.map((r) => r.firm);
+  const scorePack = {
+    startup: startupSlim,
+    vcs: firms.map((f) => ({
+      name: f.name,
+      thesis: slimThesisForLlm(thesisByName.get(f.name) || {}),
+    })),
+  };
+  const scorePrompt = `You are a senior venture analyst. Score how well this startup aligns with each VC firm's thesis (1-100).
+
+${JSON.stringify(scorePack).slice(0, 12000)}
+
+Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"analyst_read":"","fit_confidence_0_to_100":70,"top_reasons":["","",""],"gaps":["",""],"one_sentence_verdict":""}]}
+Rules: exactly one ranking per VC above in the same order; analyst_read = exactly 2 sentences synthesizing fit and key caveats (no invented metrics); fit_confidence_0_to_100 = how trustworthy this score is given sparse homepage data (integer 0-100); each top_reasons must have 3 non-empty strings; each gaps must have 2 non-empty strings; cite thesis language.
+
+Verdict and score must agree: alignment_score 70–100 ⇒ one_sentence_verdict starts with "Strong fit"; 40–69 ⇒ "Potential fit"; 0–39 ⇒ "Weak fit". top_reasons = only genuine alignment points (no "may not match", "does not align", or similar — put those in gaps).
+
+CRITICAL — no hallucinations: In top_reasons and gaps, never mention revenue, ARR, funding rounds, customer or partner names, user counts, or geographies unless that exact fact appears in the startup object above. If startup.stage is "unknown", do not claim stage alignment with the fund.
+
+If thesis fields show "unknown" (e.g. stage_focus, founder_signals), do not mention that in gaps — use two substantive diligence items (real misalignment, missing proof, sector/stage checks) instead. Never write "Firm X’s stage focus is unknown" style lines.
+
+If the fund thesis centers on a narrow vertical (e.g. voice assistants, smart home, crypto, defense) and the startup JSON does not mention that vertical, alignment_score must be at most 35 and gaps must state the mismatch clearly.`;
+
+  let rankings = [];
+  try {
+    const scored = await groqJson(scorePrompt, 'JSON only. Valid rankings array.', true, 3072);
+    rankings = Array.isArray(scored?.rankings) ? scored.rankings : [];
+  } catch {
+    /* bulk score failed — use per-VC below */
+  }
+
+  if (rankings.length < firms.length) {
+    try {
+      const perVc = await mapPool(firms, 2, async (f) => {
+        const t = slimThesisForLlm(thesisByName.get(f.name) || {});
+        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score (0-100), analyst_read (2 sentences: fit + caveats, no invented metrics), fit_confidence_0_to_100 (integer 0-100), top_reasons (3 non-empty strings), gaps (2 non-empty strings), one_sentence_verdict. firm_name must be exactly ${JSON.stringify(f.name)}.
+
+Never invent revenue, customers, or metrics. Only cite startup facts present in the JSON. If startup.stage is "unknown", do not claim stage fit. If the fund thesis is narrowly vertical (voice/smart home, crypto, etc.) and the startup JSON does not mention that vertical, cap alignment_score at 35.
+
+Verdict must match score: 70+ = "Strong fit", 40–69 = "Potential fit", below 40 = "Weak fit". top_reasons = alignment only; put hedges and mismatches in gaps.
+
+If thesis JSON has unknown fields, do not use "their stage focus is unknown" as a gap line — that reflects thin HTML, not the fund’s reputation. Prefer substantive fit/misfit reasons.`;
+        try {
+          const row = await groqJson(one, 'One VC score. JSON only.', true, 2048);
+          if (row && (row.alignment_score != null || row.top_reasons)) {
+            return { ...row, firm_name: f.name };
+          }
+        } catch {
+          /* continue */
+        }
+        return {
+          firm_name: f.name,
+          alignment_score: 35,
+          analyst_read:
+            'Match is directional based on thin homepage thesis text. Validate stage, sector, and check size on the fund’s site before outreach.',
+          fit_confidence_0_to_100: 42,
+          top_reasons: [
+            'Limited thesis text from the fund site — directional match only.',
+            `Sector overlap: ${startupSlim.sector || 'unknown'} vs fund focus.`,
+            'Review fund site and portfolio for a sharper fit read.',
+          ],
+          gaps: ['Thesis extraction may be thin or generic.', 'Stage fit not verified from primary sources.'],
+          one_sentence_verdict: 'Potential fit — confirm with fund materials and warm intro.',
+        };
+      });
+      rankings = perVc;
+    } catch (e2) {
+      failStep('s6', 'Step 6 — Score & rank', esc((e2.message || '').slice(0, 120)));
+      rankings = firms.map((f) => ({
+        firm_name: f.name,
+        alignment_score: 0,
+        top_reasons: ['Scoring step did not complete.'],
+        gaps: ['Try again shortly.'],
+        one_sentence_verdict: 'Weak fit — analysis incomplete.',
+      }));
+    }
+  }
+
+  rankings = rankings.map((row) => sanitizeRankingAgainstStartup(row, startupSlim, thesisByName));
+  rankings = rankings.map((row) => clampVoiceThesisVsDataStartup(row, startupSlim, thesisByName));
+
+  const firmQuality = buildFirmDataQuality(fetchResults, thesisByName);
+  rankings = rankings.map((row) =>
+    applyDataQualityToRanking(row, firmQuality.get(row.firm_name))
+  );
+  rankings.sort((a, b) => {
+    const au = a.unscorable ? 1 : 0;
+    const bu = b.unscorable ? 1 : 0;
+    if (au !== bu) return au - bu;
+    return (b.alignment_score || 0) - (a.alignment_score || 0);
+  });
+  rankings = rankings.map(normalizeRankingRow);
+  return rankings;
+}
+
 async function runPipeline(startupUrl, resolveNote = '') {
   state.stepEls.clear();
   document.getElementById('agent-log').innerHTML = '';
@@ -1888,17 +2004,23 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     }
   }
 
+  const startupSlim = slimStartupForLlm(startup);
+
   let candidatePool = mergeCandidatePool(groqPicks, FALLBACK_VCS);
-  candidatePool = await orderCandidatePoolForStartup(candidatePool, slimStartupForLlm(startup));
+  candidatePool = await orderCandidatePoolForStartup(candidatePool, startupSlim);
 
   addStep(
     's4',
     'Step 4 — Fetch VC sites (parallel)',
-    `Up to ${VC_TARGET_COUNT} funds · ${candidatePool.length} candidates…`
+    `Up to ${VC_MAX_FUNDS} funds · 2nd lazy if first scores ≥${LAZY_SECOND_MIN_SCORE} · ${candidatePool.length} candidates…`
   );
-  const { rows: fetchResults, hostsAttempted } = await fetchVcPagesWithBackfill(candidatePool, VC_TARGET_COUNT);
+
+  let lazySecondSkipped = false;
+  const fetchWave1 = await fetchVcPagesWithBackfill(candidatePool, 1);
+  let fetchResults = fetchWave1.rows;
+  let hostsAttempted = fetchWave1.hostsAttempted;
+  let triedHostsForCont = fetchWave1.triedHosts;
   let firms = fetchResults.map((r) => r.firm);
-  const okFetched = fetchResults.filter((r) => r.ok);
 
   if (firms.length === 0) {
     failStep(
@@ -1912,14 +2034,10 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     return;
   }
 
-  let backfillNote = '';
-  if (hostsAttempted > firms.length) {
-    backfillNote = ` (${hostsAttempted} candidates tried; failed loads skipped for alternates)`;
-  }
   finishStep(
     's4',
     'Step 4 — Fetch VC sites (parallel)',
-    `${okFetched.length} loaded${backfillNote}`
+    `1 loaded${hostsAttempted > 1 ? ` (${hostsAttempted} host tries)` : ''}`
   );
 
   addStep(
@@ -1928,6 +2046,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     'thinking',
     'One fund at a time (avoids Groq 429 on free tier)…'
   );
+
   const thesisInputs = fetchResults.filter((r) => r.ok && r.text.length > 50);
   const thesisList = [];
   for (let i = 0; i < thesisInputs.length; i++) {
@@ -1969,7 +2088,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     }
   }
 
-  const usedForLineup = new Set(
+  let usedForLineup = new Set(
     fetchResults.map((r) => firmHostFromFirm(r.firm)).filter(Boolean)
   );
   const triedAsThesisReplacement = new Set();
@@ -1984,39 +2103,137 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     return null;
   }
 
-  let bfRound = 0;
-  while (bfRound < 24) {
-    bfRound++;
-    const strongN = fetchResults.filter((r) =>
-      thesisDataSubstantive(thesisByName.get(r.firm.name))
-    ).length;
-    if (strongN >= VC_TARGET_COUNT) break;
-    const weakIdx = fetchResults.findIndex(
-      (r) => !thesisDataSubstantive(thesisByName.get(r.firm.name))
-    );
-    if (weakIdx < 0) break;
-    const repl = pickThesisReplacementFirm();
-    if (!repl) break;
-    triedAsThesisReplacement.add(firmHostFromFirm(repl));
-    const oldFirm = fetchResults[weakIdx].firm;
-    const oldH = firmHostFromFirm(oldFirm);
-    try {
-      if (bfRound > 1) await new Promise((res) => setTimeout(res, 700));
-      const text = await fetchStartupPage(repl.website);
-      if (!text || text.length < 50) continue;
-      const data = await extractVcThesis(text, repl.name);
-      if (!data || !thesisDataSubstantive(data)) continue;
-      thesisByName.delete(oldFirm.name);
-      if (oldH) usedForLineup.delete(oldH);
-      usedForLineup.add(firmHostFromFirm(repl));
-      fetchResults[weakIdx] = { firm: repl, text, ok: true };
-      thesisByName.set(repl.name, { ...data, _firm: repl });
-      firms = fetchResults.map((r) => r.firm);
-      thesisSwapNote += (thesisSwapNote ? '; ' : '') + `Swapped ${oldFirm.name} → ${repl.name}`;
-    } catch {
-      /* try next candidate */
+  async function runThesisSwapLoop(lineupTarget) {
+    usedForLineup = new Set(fetchResults.map((r) => firmHostFromFirm(r.firm)).filter(Boolean));
+    let bfR = 0;
+    while (bfR < 24) {
+      bfR++;
+      const strongN = fetchResults.filter((r) =>
+        thesisDataSubstantive(thesisByName.get(r.firm.name))
+      ).length;
+      if (strongN >= lineupTarget) break;
+      const weakIdx = fetchResults.findIndex(
+        (r) => !thesisDataSubstantive(thesisByName.get(r.firm.name))
+      );
+      if (weakIdx < 0) break;
+      const repl = pickThesisReplacementFirm();
+      if (!repl) break;
+      triedAsThesisReplacement.add(firmHostFromFirm(repl));
+      const oldFirm = fetchResults[weakIdx].firm;
+      const oldH = firmHostFromFirm(oldFirm);
+      try {
+        if (bfR > 1) await new Promise((res) => setTimeout(res, 700));
+        const text = await fetchStartupPage(repl.website);
+        if (!text || text.length < 50) continue;
+        const data = await extractVcThesis(text, repl.name);
+        if (!data || !thesisDataSubstantive(data)) continue;
+        thesisByName.delete(oldFirm.name);
+        if (oldH) usedForLineup.delete(oldH);
+        usedForLineup.add(firmHostFromFirm(repl));
+        fetchResults[weakIdx] = { firm: repl, text, ok: true };
+        thesisByName.set(repl.name, { ...data, _firm: repl });
+        firms = fetchResults.map((r) => r.firm);
+        thesisSwapNote += (thesisSwapNote ? '; ' : '') + `Swapped ${oldFirm.name} → ${repl.name}`;
+      } catch {
+        /* try next candidate */
+      }
     }
   }
+
+  await runThesisSwapLoop(1);
+
+  addStep('s6', 'Step 6 — Score & rank', 'thinking', 'Analyst pass (compact context)…');
+  let rankings = await scoreRankingsPipeline(fetchResults, thesisByName, startupSlim);
+
+  const firstRow = rankings[0];
+  const s0 = firstRow ? Math.min(100, Math.max(0, Number(firstRow.alignment_score) || 0)) : 0;
+  if (
+    firstRow &&
+    shouldShowVcCard(firstRow, thesisByName, startupSlim) &&
+    s0 >= LAZY_SECOND_MIN_SCORE
+  ) {
+    lazySecondSkipped = true;
+  } else if (fetchResults.length < VC_MAX_FUNDS) {
+    addStep(
+      's4',
+      'Step 4 — Fetch VC sites (parallel)',
+      'thinking',
+      'First match weak or hidden — loading second fund…'
+    );
+    const fetchWave2 = await fetchVcPagesWithBackfill(candidatePool, VC_MAX_FUNDS, {
+      existingRows: fetchResults,
+      triedHosts: triedHostsForCont,
+    });
+    fetchResults = fetchWave2.rows;
+    hostsAttempted = fetchWave2.hostsAttempted;
+    triedHostsForCont = fetchWave2.triedHosts;
+    firms = fetchResults.map((r) => r.firm);
+
+    for (const r of fetchResults) {
+      if (!thesisByName.has(r.firm.name)) {
+        thesisByName.set(r.firm.name, {
+          firm_name: r.firm.name,
+          stage_focus: 'unknown',
+          sector_focus: 'unknown',
+          founder_signals: '',
+          product_signals: '',
+          themes_or_trends: '',
+          notable_portfolio: [],
+          check_stage_hint: '',
+          geo_focus: '',
+          avoid_or_out_of_scope: '',
+          _firm: r.firm,
+          _thin: true,
+        });
+      }
+    }
+
+    const inputs2 = fetchResults.filter((r) => r.ok && r.text.length > 50);
+    let delayedExtr = false;
+    for (const r of inputs2) {
+      const cur = thesisByName.get(r.firm.name);
+      if (cur && thesisDataSubstantive(cur)) continue;
+      if (delayedExtr) await new Promise((res) => setTimeout(res, 700));
+      delayedExtr = true;
+      const data = await extractVcThesis(r.text, r.firm.name);
+      if (data && thesisDataSubstantive(data)) {
+        thesisByName.set(r.firm.name, { ...data, _firm: r.firm });
+      } else {
+        thesisByName.set(r.firm.name, {
+          firm_name: r.firm.name,
+          stage_focus: 'unknown',
+          sector_focus: 'unknown',
+          founder_signals: '',
+          product_signals: '',
+          themes_or_trends: '',
+          notable_portfolio: [],
+          check_stage_hint: '',
+          geo_focus: '',
+          avoid_or_out_of_scope: '',
+          _firm: r.firm,
+          _thin: true,
+        });
+      }
+    }
+
+    await runThesisSwapLoop(VC_MAX_FUNDS);
+    rankings = await scoreRankingsPipeline(fetchResults, thesisByName, startupSlim);
+  }
+
+  let backfillNote = '';
+  if (hostsAttempted > fetchResults.length) {
+    backfillNote = ` (${hostsAttempted} candidates tried; failed loads skipped for alternates)`;
+  }
+  const okFetched = fetchResults.filter((r) => r.ok);
+  finishStep(
+    's4',
+    'Step 4 — Fetch VC sites (parallel)',
+    `${okFetched.length} loaded${backfillNote}${
+      lazySecondSkipped
+        ? ` · second fund skipped (first ≥${LAZY_SECOND_MIN_SCORE} and passed filters)`
+        : ''
+    }`
+  );
 
   const substantiveThesisCount = fetchResults.filter((r) =>
     thesisDataSubstantive(thesisByName.get(r.firm.name))
@@ -2030,100 +2247,6 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
   );
 
   await new Promise((r) => setTimeout(r, 400));
-  addStep('s6', 'Step 6 — Score & rank', 'thinking', 'Analyst pass (compact context)…');
-  const startupSlim = slimStartupForLlm(startup);
-  const scorePack = {
-    startup: startupSlim,
-    vcs: firms.map((f) => ({
-      name: f.name,
-      thesis: slimThesisForLlm(thesisByName.get(f.name) || {}),
-    })),
-  };
-
-  const scorePrompt = `You are a senior venture analyst. Score how well this startup aligns with each VC firm's thesis (1-100).
-
-${JSON.stringify(scorePack).slice(0, 12000)}
-
-Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"analyst_read":"","fit_confidence_0_to_100":70,"top_reasons":["","",""],"gaps":["",""],"one_sentence_verdict":""}]}
-Rules: exactly one ranking per VC above in the same order; analyst_read = exactly 2 sentences synthesizing fit and key caveats (no invented metrics); fit_confidence_0_to_100 = how trustworthy this score is given sparse homepage data (integer 0-100); each top_reasons must have 3 non-empty strings; each gaps must have 2 non-empty strings; cite thesis language.
-
-Verdict and score must agree: alignment_score 70–100 ⇒ one_sentence_verdict starts with "Strong fit"; 40–69 ⇒ "Potential fit"; 0–39 ⇒ "Weak fit". top_reasons = only genuine alignment points (no "may not match", "does not align", or similar — put those in gaps).
-
-CRITICAL — no hallucinations: In top_reasons and gaps, never mention revenue, ARR, funding rounds, customer or partner names, user counts, or geographies unless that exact fact appears in the startup object above. If startup.stage is "unknown", do not claim stage alignment with the fund.
-
-If thesis fields show "unknown" (e.g. stage_focus, founder_signals), do not mention that in gaps — use two substantive diligence items (real misalignment, missing proof, sector/stage checks) instead. Never write "Firm X’s stage focus is unknown" style lines.
-
-If the fund thesis centers on a narrow vertical (e.g. voice assistants, smart home, crypto, defense) and the startup JSON does not mention that vertical, alignment_score must be at most 35 and gaps must state the mismatch clearly.`;
-
-  let rankings = [];
-  try {
-    const scored = await groqJson(scorePrompt, 'JSON only. Valid rankings array.', true, 3072);
-    rankings = Array.isArray(scored?.rankings) ? scored.rankings : [];
-  } catch (e) {
-    /* bulk score failed — use per-VC below */
-  }
-
-  if (rankings.length < firms.length) {
-    try {
-      const perVc = await mapPool(firms, 2, async (f) => {
-        const t = slimThesisForLlm(thesisByName.get(f.name) || {});
-        const one = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC firm: ${f.name}\nThesis summary:\n${JSON.stringify(t)}\n\nReturn JSON only with keys: firm_name, alignment_score (0-100), analyst_read (2 sentences: fit + caveats, no invented metrics), fit_confidence_0_to_100 (integer 0-100), top_reasons (3 non-empty strings), gaps (2 non-empty strings), one_sentence_verdict. firm_name must be exactly ${JSON.stringify(f.name)}.
-
-Never invent revenue, customers, or metrics. Only cite startup facts present in the JSON. If startup.stage is "unknown", do not claim stage fit. If the fund thesis is narrowly vertical (voice/smart home, crypto, etc.) and the startup JSON does not mention that vertical, cap alignment_score at 35.
-
-Verdict must match score: 70+ = "Strong fit", 40–69 = "Potential fit", below 40 = "Weak fit". top_reasons = alignment only; put hedges and mismatches in gaps.
-
-If thesis JSON has unknown fields, do not use "their stage focus is unknown" as a gap line — that reflects thin HTML, not the fund’s reputation. Prefer substantive fit/misfit reasons.`;
-        try {
-          const row = await groqJson(one, 'One VC score. JSON only.', true, 2048);
-          if (row && (row.alignment_score != null || row.top_reasons)) {
-            return { ...row, firm_name: f.name };
-          }
-        } catch {
-          /* continue */
-        }
-        return {
-          firm_name: f.name,
-          alignment_score: 35,
-          analyst_read:
-            'Match is directional based on thin homepage thesis text. Validate stage, sector, and check size on the fund’s site before outreach.',
-          fit_confidence_0_to_100: 42,
-          top_reasons: [
-            'Limited thesis text from the fund site — directional match only.',
-            `Sector overlap: ${startupSlim.sector || 'unknown'} vs fund focus.`,
-            'Review fund site and portfolio for a sharper fit read.',
-          ],
-          gaps: ['Thesis extraction may be thin or generic.', 'Stage fit not verified from primary sources.'],
-          one_sentence_verdict: 'Potential fit — confirm with fund materials and warm intro.',
-        };
-      });
-      rankings = perVc;
-    } catch (e2) {
-      failStep('s6', 'Step 6 — Score & rank', esc((e2.message || '').slice(0, 120)));
-      rankings = firms.map((f) => ({
-        firm_name: f.name,
-        alignment_score: 0,
-        top_reasons: ['Scoring step did not complete.'],
-        gaps: ['Try again shortly.'],
-        one_sentence_verdict: 'Weak fit — analysis incomplete.',
-      }));
-    }
-  }
-
-  rankings = rankings.map((row) => sanitizeRankingAgainstStartup(row, startupSlim, thesisByName));
-  rankings = rankings.map((row) => clampVoiceThesisVsDataStartup(row, startupSlim, thesisByName));
-
-  const firmQuality = buildFirmDataQuality(fetchResults, thesisByName);
-  rankings = rankings.map((row) =>
-    applyDataQualityToRanking(row, firmQuality.get(row.firm_name))
-  );
-  rankings.sort((a, b) => {
-    const au = a.unscorable ? 1 : 0;
-    const bu = b.unscorable ? 1 : 0;
-    if (au !== bu) return au - bu;
-    return (b.alignment_score || 0) - (a.alignment_score || 0);
-  });
-  rankings = rankings.map(normalizeRankingRow);
 
   const rankingsForDisplay = rankings.filter((r) => shouldShowVcCard(r, thesisByName, startupSlim));
   const omittedFromReport = rankings.length - rankingsForDisplay.length;
