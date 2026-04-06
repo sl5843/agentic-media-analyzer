@@ -341,7 +341,7 @@
   <div class="wrap">
     <header>
       <h1>Startup Signal Scorer</h1>
-      <p>Single autonomous agent — paste a <strong>homepage URL</strong> or type a <strong>company name</strong> (name lookup uses the same SerpAPI key as VC discovery), then <strong>Analyze</strong>. Uses <strong>Groq</strong> via <code>/api/groq</code>.</p>
+      <p>Single autonomous agent — paste a <strong>homepage URL</strong> or type a <strong>company name</strong> (name lookup uses the same SerpAPI key as VC discovery), then <strong>Analyze</strong>. Picks <strong>one</strong> best-matching fund to fetch, score, and pitch. Uses <strong>Groq</strong> via <code>/api/groq</code>.</p>
       <div class="input-row">
         <input type="text" id="url-input" placeholder="https://notion.so or Notion" autocomplete="off" spellcheck="false" />
         <button type="button" id="run-btn">Analyze</button>
@@ -356,7 +356,7 @@
       <div class="panel">
         <div class="panel-head">Live results</div>
         <div id="report-area">
-          <p class="placeholder" id="report-placeholder">Enter a startup URL or company name to see the snapshot and VC match rankings as each step finishes.</p>
+          <p class="placeholder" id="report-placeholder">Enter a startup URL or company name to see the snapshot and a single top VC match as each step finishes.</p>
           <div id="live-sections" style="display:none;"></div>
         </div>
       </div>
@@ -385,8 +385,8 @@ const FALLBACK_VCS = [
   { name: 'Antler', website: 'https://www.antler.co/' },
 ];
 
-/** VC funds to fetch, extract theses for, and score (lower = faster). */
-const VC_TARGET_COUNT = 3;
+/** VC funds to fetch, extract theses for, and score (lower = faster). Single match = sharper report. */
+const VC_TARGET_COUNT = 1;
 
 const state = { stepEls: new Map(), groqOk: false };
 
@@ -894,6 +894,10 @@ function thesisWorthShowingInUi(raw) {
   return true;
 }
 
+/** Normalized fallback from normalizeRankingRow when the model returns thin reasons. */
+const PLACEHOLDER_TOP_REASON =
+  'No specific fit reason returned — use fund thesis and portfolio to validate.';
+
 /** Omit low-signal rows so the report stays credible (user request: don’t list “empty” VCs). */
 function shouldShowVcCard(r, thesisByName) {
   if (r.unscorable) return false;
@@ -901,6 +905,15 @@ function shouldShowVcCard(r, thesisByName) {
   const score = Math.min(100, Math.max(0, Number(r.alignment_score) || 0));
   const v = String(r.one_sentence_verdict || '').toLowerCase();
   if (score <= 0 && v.includes('weak')) return false;
+
+  const fc = Number(r.fit_confidence_0_to_100);
+  const hasFc = r.fit_confidence_0_to_100 != null && !Number.isNaN(fc);
+  if (score <= 0 && hasFc && fc === 0) return false;
+
+  const reasons = (Array.isArray(r.top_reasons) ? r.top_reasons : []).map((x) => String(x || '').trim());
+  const placeholderN = reasons.filter((x) => x === PLACEHOLDER_TOP_REASON).length;
+  if (placeholderN >= 2 && score <= 15 && (!hasFc || fc <= 25)) return false;
+
   return true;
 }
 
@@ -1425,7 +1438,7 @@ function normalizeRankingRow(r) {
     .map((x) => String(x || '').trim())
     .filter(Boolean);
   while (reasons.length < 3) {
-    reasons.push('No specific fit reason returned — use fund thesis and portfolio to validate.');
+    reasons.push(PLACEHOLDER_TOP_REASON);
   }
   while (gaps.length < 2) {
     gaps.push('Confirm stage, sector, and check size against this fund’s recent deals.');
@@ -1898,13 +1911,13 @@ If thesis JSON has unknown fields, do not use "their stage focus is unknown" as 
     finishStep('s6', 'Step 6 — Score & rank', parts.join(' · '));
   }
 
-  let vcCardsHtml = '<h2>VC match rankings</h2>';
+  let vcCardsHtml = `<h2>${rankingsForDisplay.length === 1 ? 'Top VC match' : 'VC match rankings'}</h2>`;
   if (serpDiscoveryFailed) {
     vcCardsHtml += '<p class="evidence">SerpAPI had no results, so discovery started from the curated fund list.</p>';
   }
   if (omittedFromReport > 0) {
     vcCardsHtml +=
-      '<p class="evidence">Funds with no usable thesis on their homepage, insufficient data, or a 0 weak-fit score are omitted so the list stays actionable.</p>';
+      '<p class="evidence">Some discovered funds were omitted: unusable homepage thesis, insufficient data, weak fit with a 0 score, or a placeholder-only score block (0 confidence / generic reasons).</p>';
   }
   if (rankingsForDisplay.length === 0) {
     vcCardsHtml +=
@@ -2048,7 +2061,7 @@ biggest_uncertainty = one short paragraph on methodology limits (thin homepages,
       };
     } catch {
       reflect.uncertainty =
-        'Treat rankings as directional: thesis text is often thin and discovery may use a fallback fund list.';
+        'Treat the match as directional: thesis text is often thin and discovery may use a fallback fund list.';
     }
   }
   finishStep('s8', 'Step 8 — Reflect', `Confidence ${reflect.confidence}/100`);
