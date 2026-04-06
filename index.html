@@ -703,6 +703,46 @@ async function mapPool(items, concurrency, fn) {
   return results;
 }
 
+/**
+ * Re-order Serp+fallback candidates so the first successful fetch is more likely to fit the startup
+ * (reduces “random biotech fund” for a SaaS company when VC_TARGET_COUNT is 1).
+ */
+async function orderCandidatePoolForStartup(pool, startupSlim) {
+  if (!Array.isArray(pool) || pool.length <= 1) return pool;
+  const max = Math.min(14, pool.length);
+  const slice = pool.slice(0, max);
+  const idxPack = slice.map((f, i) => ({ i, name: f.name, website: f.website }));
+  const prompt = `Order VC funds by plausible fit for THIS startup. You only have names and domains — use common knowledge lightly; deprioritize obviously narrow mismatches.
+
+Startup:
+${JSON.stringify({
+    company_name: startupSlim.company_name,
+    sector: startupSlim.sector,
+    stage: startupSlim.stage,
+    business_model: startupSlim.business_model,
+    one_line_description: String(startupSlim.one_line_description || '').slice(0, 220),
+  })}
+
+Funds (index i must appear exactly once in output):
+${JSON.stringify(idxPack)}
+
+Return JSON only: {"order":[...]} — permutation of indices 0..${max - 1}, BEST plausible fit first. Put dedicated life-sciences/biotech-only funds LAST for enterprise software / devtools / horizontal SaaS without healthcare in the startup JSON. Put crypto-native funds LAST unless the startup is clearly web3/fintech-crypto.`;
+
+  try {
+    const o = await groqJson(prompt, 'JSON only: {"order": number[]}. Every index 0..n-1 exactly once.', true, 900);
+    const ord = Array.isArray(o?.order) ? o.order.map((n) => Number(n)) : [];
+    const valid = new Set(slice.map((_, i) => i));
+    const filt = ord.filter((n) => valid.has(n));
+    if (filt.length !== slice.length) return pool;
+    const seen = new Set(filt);
+    if (seen.size !== slice.length) return pool;
+    const reordered = filt.map((i) => slice[i]);
+    return [...reordered, ...pool.slice(max)];
+  } catch {
+    return pool;
+  }
+}
+
 /** Groq picks first, then fallbacks; dedupe by hostname. */
 function mergeCandidatePool(primaryFirms, fallbackList) {
   const seen = new Set();
@@ -918,8 +958,27 @@ const PLACEHOLDER_TOP_REASON =
 const GENERIC_FIT_REASON_PAD =
   'Directional overlap from thesis excerpt vs startup JSON — confirm on the fund site before outreach.';
 
+/** Obvious vertical clash between extracted thesis and startup JSON (heuristic). */
+function thesisStartupSectorClash(thesisRaw, startupSlim) {
+  if (!thesisRaw || !startupSlim) return false;
+  const tls = `${String(thesisRaw.sector_focus || '')} ${String(thesisRaw.themes_or_trends || '')} ${String(thesisRaw.product_signals || '')}`.toLowerCase();
+  const ss = `${String(startupSlim.sector || '')} ${String(startupSlim.one_line_description || '')} ${String(startupSlim.target_customer || '')} ${String(startupSlim.business_model || '')}`.toLowerCase();
+  const bio = /\b(bio\s*tech|biotechnology|therapeutics|life sciences|pharma|medical device|genomics|diagnostics)\b/i.test(
+    tls
+  );
+  const soft = /\b(software|saas|devtools|developer tools|api\b|cloud|b2b\b|llm|generative ai|machine learning infra|data infra)\b/i.test(
+    ss
+  );
+  if (bio && soft && !/\b(health|bio|med|clinical|patient|drug|care|therapeutic|diagnostic)\b/i.test(ss)) {
+    return true;
+  }
+  const crypto = /\b(crypto|web3|blockchain|defi|nft)\b/i.test(tls);
+  if (crypto && !/\b(crypto|web3|blockchain|defi|nft|fintech)\b/i.test(ss)) return true;
+  return false;
+}
+
 /** Omit low-signal rows so the report stays credible (user request: don’t list “empty” VCs). */
-function shouldShowVcCard(r, thesisByName) {
+function shouldShowVcCard(r, thesisByName, startupSlim) {
   if (r.unscorable) return false;
   if (!thesisWorthShowingInUi(thesisByName.get(r.firm_name))) return false;
   const score = Math.min(100, Math.max(0, Number(r.alignment_score) || 0));
@@ -933,6 +992,14 @@ function shouldShowVcCard(r, thesisByName) {
   const reasons = (Array.isArray(r.top_reasons) ? r.top_reasons : []).map((x) => String(x || '').trim());
   const placeholderN = reasons.filter((x) => x === PLACEHOLDER_TOP_REASON).length;
   if (placeholderN >= 2 && score <= 15 && (!hasFc || fc <= 25)) return false;
+
+  if (
+    startupSlim &&
+    thesisStartupSectorClash(thesisByName.get(r.firm_name), startupSlim) &&
+    score < 42
+  ) {
+    return false;
+  }
 
   return true;
 }
@@ -1234,10 +1301,55 @@ function scrubVacuousThesisUnknownGaps(gapList) {
   return out;
 }
 
+/** Lines that cite “unknown” thesis fields as a knock — drop from “Why it fits” (not a positive). */
+function isVacuousThesisUnknownReason(s) {
+  const t = String(s || '').trim().toLowerCase();
+  if (!t) return true;
+  if (
+    /stage focus is unknown|founder signals are unknown|’s stage focus is unknown|'s stage focus is unknown/.test(t)
+  ) {
+    return true;
+  }
+  if (/\bunknown\b/.test(t) && /(difficult to assess|hard to assess|cannot assess|unclear how)/i.test(t)) {
+    return true;
+  }
+  return false;
+}
+
+function wordOverlapRatio(a, b) {
+  const wa = new Set(
+    String(a || '')
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 2)
+  );
+  const wb = new Set(
+    String(b || '')
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length > 2)
+  );
+  if (wa.size === 0 || wb.size === 0) return 0;
+  let inter = 0;
+  for (const w of wa) if (wb.has(w)) inter++;
+  return inter / Math.min(wa.size, wb.size);
+}
+
+/** Collapse near-duplicate gap lines (same mismatch stated twice). */
+function dedupeNearDuplicateGaps(gapList) {
+  const items = gapList.map((x) => String(x || '').trim()).filter(Boolean);
+  const out = [];
+  for (const s of items) {
+    if (out.some((k) => wordOverlapRatio(s, k) >= 0.55)) continue;
+    out.push(s);
+  }
+  return out;
+}
+
 /** Hedge / misalignment lines belong in gaps, not under “Why it fits”. */
 function partitionHedgesToGaps(topReasons, gapList) {
   const hedgeRe =
-    /\b(may not|might not|does not align|don't align|do not align|doesn't align|does not match|do not match|not (really |perfectly )?match|mismatch|misaligned|does not reflect|is not reflected|lacks? (strong )?alignment|unlikely to|poor fit|no explicit|not explicitly|doesn't match)\b/i;
+    /\b(may not|might not|does not align|don't align|do not align|doesn't align|does not match|do not match|not (really |perfectly )?match|mismatch|misaligned|does not reflect|is not reflected|lacks? (strong )?alignment|unlikely to|poor fit|no explicit|not explicitly|doesn't match|no clear connection|unclear connection|no obvious connection|difficult to assess|hard to assess|makes it difficult|little connection)\b/i;
   const reasons = (Array.isArray(topReasons) ? topReasons : [])
     .map((x) => String(x || '').trim())
     .filter(Boolean);
@@ -1524,13 +1636,14 @@ function normalizeRankingRow(r) {
   score = Math.min(100, Math.max(0, score));
   let reasons = (Array.isArray(r?.top_reasons) ? r.top_reasons : [])
     .map((x) => String(x || '').trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((line) => !isVacuousThesisUnknownReason(line));
   let gaps = (Array.isArray(r?.gaps) ? r.gaps : [])
     .map((x) => String(x || '').trim())
     .filter(Boolean);
   const parted = partitionHedgesToGaps(reasons, gaps);
   reasons = parted.top_reasons;
-  gaps = parted.gaps;
+  gaps = dedupeNearDuplicateGaps(parted.gaps);
   while (reasons.length < 3) {
     reasons.push(reasons.length === 0 ? PLACEHOLDER_TOP_REASON : GENERIC_FIT_REASON_PAD);
   }
@@ -1739,7 +1852,16 @@ Excerpt:
     const serpPack = JSON.stringify(
       organic.slice(0, 12).map((o) => ({ title: o.title, link: o.link, snippet: o.snippet }))
     ).slice(0, 7500);
-    const pickPrompt = `From these Google results, list up to 10 distinct venture capital firms or funds (not portfolio companies, not news sites). Prefer diverse, relevant funds. JSON: {"firms":[{"name":"","website":"https://..."}]}
+    const pickPrompt = `Startup being evaluated (for relevance only — do NOT list this company as a VC):
+${JSON.stringify({
+      company_name: startup.company_name,
+      sector: startup.sector,
+      stage: startup.stage,
+      one_line_description: String(startup.one_line_description || '').slice(0, 240),
+    })}
+
+From these Google results, list up to 10 distinct venture capital firms or funds (not portfolio companies, not news sites). JSON: {"firms":[{"name":"","website":"https://..."}]}
+ORDER firms with the STRONGEST plausible sector/stage fit for this startup FIRST. Omit or do not include funds that are clearly dedicated to an unrelated vertical (e.g. pure biotechnology / life-science funds for horizontal B2B SaaS or devtools with no healthcare angle in the startup JSON).
 Websites must be the fund's own domain. Return as many solid funds as you can (aim for 8–10) so there are alternates if some sites fail to load or thesis text is thin.`;
     try {
       const picked = await groqJson(serpPack + '\n\nQuery: ' + searchQ, pickPrompt, true, 1536);
@@ -1766,7 +1888,8 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
     }
   }
 
-  const candidatePool = mergeCandidatePool(groqPicks, FALLBACK_VCS);
+  let candidatePool = mergeCandidatePool(groqPicks, FALLBACK_VCS);
+  candidatePool = await orderCandidatePoolForStartup(candidatePool, slimStartupForLlm(startup));
 
   addStep(
     's4',
@@ -2002,11 +2125,15 @@ If thesis JSON has unknown fields, do not use "their stage focus is unknown" as 
   });
   rankings = rankings.map(normalizeRankingRow);
 
-  const rankingsForDisplay = rankings.filter((r) => shouldShowVcCard(r, thesisByName));
+  const rankingsForDisplay = rankings.filter((r) => shouldShowVcCard(r, thesisByName, startupSlim));
   const omittedFromReport = rankings.length - rankingsForDisplay.length;
   {
     const parts = [`${rankingsForDisplay.length} in report`];
-    if (omittedFromReport > 0) parts.push(`${omittedFromReport} omitted (thin/unusable thesis or not shown)`);
+    if (omittedFromReport > 0) {
+      parts.push(
+        `${omittedFromReport} omitted (thin thesis, off-sector low-score match, placeholder score block, or not shown)`
+      );
+    }
     finishStep('s6', 'Step 6 — Score & rank', parts.join(' · '));
   }
 
@@ -2016,11 +2143,11 @@ If thesis JSON has unknown fields, do not use "their stage focus is unknown" as 
   }
   if (omittedFromReport > 0) {
     vcCardsHtml +=
-      '<p class="evidence">Some discovered funds were omitted: unusable homepage thesis, insufficient data, weak fit with a 0 score, or a placeholder-only score block (0 confidence / generic reasons).</p>';
+      '<p class="evidence">Some funds were omitted: thin thesis, off-sector match with a low score, weak 0 score, or placeholder-only reasons. Discovery order is startup-aware; re-run for a different Serp draw if the list was noisy.</p>';
   }
   if (rankingsForDisplay.length === 0) {
     vcCardsHtml +=
-      '<p class="evidence">Nothing to show — discovery returned only thin homepages or unusable extractions. Re-run, paste a URL, or try another batch of funds.</p>';
+      '<p class="evidence">Nothing to show — the loaded fund was omitted (often off-sector vs your profile or unusable thesis), or the page could not be scored. Re-run to reshuffle discovery, or start from a different company query.</p>';
   } else {
     vcCardsHtml += '<div class="vc-grid">';
   rankingsForDisplay.forEach((r, idx) => {
