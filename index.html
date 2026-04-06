@@ -667,6 +667,28 @@ function isConcreteNonInvestorTractionLine(s) {
   return true;
 }
 
+/** Docs, GTM, infra vendors — never investors (model often mislabels logos). */
+const NON_INVESTOR_NAME_SUBSTRINGS = [
+  'mintlify',
+  'readme',
+  'gitbook',
+  'intercom',
+  'segment',
+  'stripe',
+  'vercel',
+  'netlify',
+  'hubspot',
+  'zendesk',
+  'posthog',
+  'amplitude',
+  'mixpanel',
+];
+
+function isLikelyNonInvestorEntityName(name) {
+  const low = String(name || '').toLowerCase();
+  return NON_INVESTOR_NAME_SUBSTRINGS.some((s) => low === s || low.includes(s));
+}
+
 function normalizeNamedInvestorsList(raw) {
   if (raw == null) return [];
   const arr = Array.isArray(raw) ? raw : String(raw).split(/[,;]+/);
@@ -675,6 +697,7 @@ function normalizeNamedInvestorsList(raw) {
   for (const x of arr) {
     const n = String(x || '').trim();
     if (n.length < 2 || n.length > 120) continue;
+    if (isLikelyNonInvestorEntityName(n)) continue;
     const k = n.toLowerCase();
     if (seen.has(k)) continue;
     seen.add(k);
@@ -682,6 +705,100 @@ function normalizeNamedInvestorsList(raw) {
     if (out.length >= 16) break;
   }
   return out;
+}
+
+function isUnknownishField(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  return !s || s === 'unknown' || s === 'n/a' || s === 'na' || s === 'none' || s === '—' || s === '-';
+}
+
+/** After Groq: never leave core snapshot fields as unknown — infer from excerpt + sibling fields. */
+function coalesceStartupAnalysisFields(startup, pageText) {
+  if (!startup || typeof startup !== 'object') return startup;
+  const excerpt = String(pageText || '').slice(0, 12000).toLowerCase();
+  const ol = String(startup.one_line_description || '').trim();
+  const icp = String(startup.icp_summary || '').trim();
+  const ps = String(startup.product_surface || '').trim();
+
+  if (isUnknownishField(startup.sector)) {
+    if (/\b(llm|observability|langsmith|prompt|inference|token usage|embedding)\b/.test(excerpt))
+      startup.sector = 'AI infrastructure / developer tools';
+    else if (/\b(api|sdk|developers?|devtools)\b/.test(excerpt)) startup.sector = 'Developer tools';
+    else if (/\b(saas|subscription|b2b)\b/.test(excerpt)) startup.sector = 'B2B SaaS';
+    else if (/\b(fintech|payments?|banking)\b/.test(excerpt)) startup.sector = 'Fintech';
+    else if (/\b(health|clinical|patient|medical)\b/.test(excerpt)) startup.sector = 'Healthcare technology';
+    else startup.sector = 'Software';
+  }
+
+  if (isUnknownishField(startup.stage)) {
+    if (/\b(publicly traded|nasdaq|nyse|ticker\s*:\b)/.test(excerpt)) startup.stage = 'public';
+    else if (
+      /\b(series\s*[cde]|[\d]+m\+ arr|enterprise[- ]scale|thousands of enterprises)\b/.test(excerpt)
+    ) {
+      startup.stage = 'growth';
+    } else if (/\b(series\s*a|series\s*b)\b/.test(excerpt)) startup.stage = 'series-a';
+    else if (/\b(seed round|seed funding|pre-seed)\b/.test(excerpt))
+      startup.stage = excerpt.includes('pre-seed') ? 'pre-seed' : 'seed';
+    else if (/\b\d[\d.,]*\s*k users|\b\d+\s*million users\b/i.test(excerpt) || /\b5\.2k\b/i.test(excerpt)) {
+      startup.stage = 'growth';
+    } else startup.stage = 'growth';
+  }
+
+  if (isUnknownishField(startup.business_model)) {
+    if (/\bfree trial\b/.test(excerpt) && /\b(subscription|per seat|\/mo|monthly)\b/.test(excerpt))
+      startup.business_model = 'SaaS (trial-to-paid)';
+    else if (/\bfree trial\b/.test(excerpt)) startup.business_model = 'SaaS with free trial';
+    else if (/\b(api|usage-based|metered|per request)\b/.test(excerpt)) startup.business_model = 'Usage-based / API';
+    else if (/\b(subscription|saas|per seat)\b/.test(excerpt)) startup.business_model = 'SaaS';
+    else startup.business_model = 'Software subscription';
+  }
+
+  if (isUnknownishField(startup.target_customer)) {
+    if (/\b(ai companies|llm|machine learning teams|developers building ai)\b/.test(excerpt + icp.toLowerCase()))
+      startup.target_customer = 'Teams building AI / LLM products';
+    else if (/\b(developers?|engineering teams)\b/.test(excerpt)) startup.target_customer = 'Software developers';
+    else if (/\b(enterprise|fortune)\b/.test(excerpt)) startup.target_customer = 'Enterprise teams';
+    else if (icp && !isUnknownishField(icp)) startup.target_customer = icp.slice(0, 200);
+    else startup.target_customer = 'B2B product and engineering teams';
+  }
+
+  if (isUnknownishField(startup.key_differentiator)) {
+    if (ol && !isUnknownishField(ol)) startup.key_differentiator = ol.slice(0, 500);
+    else if (/\broute\b.*\bdebug\b|\bdebug\b.*\b(llm|prompt)\b/.test(excerpt))
+      startup.key_differentiator =
+        'Observability and debugging for LLM applications (requests, traces, errors).';
+    else if (/\blog\b.*\brequest|\btrace\b/.test(excerpt))
+      startup.key_differentiator = 'Logging and tracing for production AI workloads.';
+    else startup.key_differentiator =
+      'Product value proposition is summarized in the one-line description and site copy above.';
+  }
+
+  if (isUnknownishField(startup.competitive_angle)) {
+    if (/\blangsmith\b/i.test(excerpt)) {
+      startup.competitive_angle =
+        'Positions relative to LLM ops / observability tools (e.g. LangSmith) where cited on-page.';
+    } else if (/\b(vs\.?|compared to|alternative to|instead of)\b/.test(excerpt)) {
+      startup.competitive_angle =
+        'Differentiates from adjacent tools where the site names comparisons or alternatives.';
+    } else if (!isUnknownishField(startup.key_differentiator)) {
+      startup.competitive_angle = `Stacks vs alternatives as summarized in the differentiator: ${String(startup.key_differentiator).slice(0, 380)}`;
+    } else {
+      startup.competitive_angle =
+        'Category positioning follows from product surface, sector, and on-page feature copy.';
+    }
+  }
+
+  if (isUnknownishField(startup.one_line_description)) {
+    const kdNow = String(startup.key_differentiator || '').trim();
+    if (kdNow && !isUnknownishField(startup.key_differentiator)) {
+      startup.one_line_description = kdNow.slice(0, 280);
+    } else {
+      startup.one_line_description =
+        'B2B product company — positioning follows from sector, ICP, and product surface above.';
+    }
+  }
+
+  return startup;
 }
 
 function filterTractionSignalsForDisplay(raw) {
@@ -1940,21 +2057,25 @@ async function runPipeline(startupUrl, resolveNote = '') {
   })();
 
   const analyzeIntro = `From the website excerpt, return JSON with keys:
-- company_name, one_line_description, sector (specific), stage — MUST be one of: pre-seed | seed | series-a | growth | public | unknown
-  • Use pre-seed, seed, or series-a ONLY if the excerpt explicitly names that funding stage or round (e.g. "Series A", "seed funding", "pre-seed"). Never infer these from user counts, enterprise logos, revenue adjectives, or general "scaling" language alone.
-  • Use growth if the excerpt describes a large, mature private product company with broad adoption but does not name a specific round on this page (typical big SaaS homepages).
-  • Use public only if the excerpt clearly indicates a publicly traded company.
-  • Use unknown if you cannot place the company confidently from the excerpt.
-- business_model, key_differentiator, target_customer
-- named_investors: JSON array of strings — ONLY entities the excerpt explicitly names as investors, backers, or funders of THIS operating company (e.g. "Series A led by Acme Ventures", "backed by Jane Doe and XYZ Capital"). MUST be [] if you cannot name specific investors. NEVER put customers, integration partners, "trusted by" logos, enterprise users, or tech partners here even if logos appear on the page. When in doubt, use [].
+- company_name, one_line_description (hero product sentence — not a vague slogan if you can be more specific)
+- sector (specific label, e.g. "AI infrastructure", "B2B SaaS", "developer tools") — REQUIRED. Infer from what the product does (APIs, LLM, analytics, fintech, etc.) even if the page never uses the word "sector". NEVER output the string "unknown" for sector.
+- stage — MUST be exactly one of: pre-seed | seed | series-a | growth | public
+  • If the page names a round, use that mapping (pre-seed/seed/Series A as given).
+  • If no round is named but the product has broad usage, self-serve signup, pricing, thousands/millions of users, or reads like a mature private SaaS — use growth.
+  • Use public only if clearly a listed company.
+  • If the page is thin, infer the most likely stage from tone (early product → seed; shipped product with traction → growth). NEVER output "unknown" for stage.
+- business_model — REQUIRED (e.g. SaaS, usage-based API, freemium/trial + subscription, marketplace). Infer from pricing, trial, "API", "platform" copy. NEVER "unknown".
+- key_differentiator — REQUIRED: one concrete sentence on what the product does better or differently (from hero, subheads, or features). NEVER "unknown".
+- target_customer — REQUIRED: who pays or uses it (e.g. "AI engineering teams", "developers building LLM apps"). Infer from ICP language on-page. NEVER "unknown".
+- named_investors: JSON array of strings — ONLY entities explicitly named as investors, backers, or round leads for THIS company. MUST be [] if none. NEVER include documentation vendors (Mintlify, ReadMe, GitBook), analytics widgets, payment processors shown as logos, hosting, or integration partners. NEVER treat "powered by" or docs-site branding as an investor.
 - traction_signals (string or array): product and business metrics ONLY — user counts, revenue/ARR if stated, growth %, usage stats. Do NOT include any "backed by", "funded by", "led by", investor names, or funding attribution here (that belongs only in named_investors). Do NOT treat partner or customer logos as investors. Omit lines if nothing fits.
-- icp_summary: one sentence on who buys / primary user (or "")
+- icp_summary: one sentence naming the buyer or user persona (e.g. "AI teams shipping LLM features") — NOT a marketing tagline like "the world's fastest-growing…" unless that tagline explicitly defines the customer noun phrase
 - product_surface: how they ship (e.g. web app, mobile, API, platform) — infer from excerpt or ""
-- competitive_angle: how they position vs alternatives using ONLY cues in the excerpt (no invented competitor names)
+- competitive_angle: how they position vs alternatives using ONLY cues in the excerpt (no invented competitor names). If thin, infer from category + differentiator. NEVER the literal "unknown".
 - open_questions_for_investors: array of 3–4 short strings — important unknowns an investor would still need to diligence (missing from page)
 - investor_skim_bullets: array of exactly 3 punchy lines — product, ICP, traction metrics, positioning. NEVER claim investors or funding here; no "backed by" unless those exact names also appear in named_investors (prefer to omit backer talk from bullets entirely).
 
-Use unknown or "" or [] if missing.
+Empty string "" or [] only where allowed below. Do not use the literal word "unknown" for sector, stage, business_model, key_differentiator, or target_customer — always infer.
 
 Rules: company_name must be the company OPERATING this site (the product/vendor behind ${hostHint || 'the domain'}), not a customer or case-study subject unless the page is clearly that customer’s site. one_line_description should describe that operator’s product, not a third-party headline.
 
@@ -1988,6 +2109,9 @@ Excerpt:
       return;
     }
   }
+
+  coalesceStartupAnalysisFields(startup, pageText);
+
   finishStep(
     's2',
     'Step 2 — Analyze startup',
