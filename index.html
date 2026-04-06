@@ -829,6 +829,7 @@ function thesisDigestLineIsNoise(v) {
 function isThesisExtractionGarbage(raw) {
   if (!raw || typeof raw !== 'object') return true;
   const sec = String(raw.sector_focus || '').trim().toLowerCase();
+  if (/cautious inference/i.test(sec)) return true;
   if (
     /mostly\s*navigation|^navigation\s*$|^nav\s*$|^site\s+is\s+mostly|^homepage\s+is\s+mostly/i.test(sec) ||
     (/^[^.]{0,40}navigation[^.]{0,20}$/i.test(sec) && String(raw.product_signals || '').trim().length < 8)
@@ -836,6 +837,54 @@ function isThesisExtractionGarbage(raw) {
     return true;
   }
   return false;
+}
+
+function cleanThesisPortfolioEntry(name) {
+  const s = String(name || '').trim();
+  if (!s || s.length > 100) return null;
+  if (
+    /not explicitly stated|company name not|explicitly stated by|cautious inference|editor'?s?\s+note|^unknown$/i.test(s)
+  ) {
+    return null;
+  }
+  return s;
+}
+
+/** Strip model meta-commentary and “navigation” slop from thesis strings. */
+function cleanThesisTextField(s) {
+  if (s == null) return '';
+  let t = String(s);
+  t = t.replace(/\(?\s*cautious inference\s*\)?/gi, ' ').trim();
+  t = t.replace(/\bnot explicitly stated\b[^.!?]*[.!?]?/gi, ' ').trim();
+  t = t.replace(/\bcompany name not\b[^.!?]*[.!?]?/gi, ' ').trim();
+  t = t.replace(/\s*,\s*navigation\s*(?:\([^)]*\))?/gi, ', ').trim();
+  t = t.replace(/,\s*navigation\s*$/i, '').trim();
+  t = t.replace(/^navigation\s*,\s*/i, '').trim();
+  t = t.replace(/\bsoftware companies\s*,\s*navigation\b/gi, 'software companies').trim();
+  t = t.replace(/\s{2,}/g, ' ').replace(/\s*,\s*,+/g, ',').replace(/^[,·\s]+|[,·\s]+$/g, '');
+  return t.trim();
+}
+
+function cleanExtractedThesis(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const strKeys = [
+    'sector_focus',
+    'stage_focus',
+    'founder_signals',
+    'product_signals',
+    'themes_or_trends',
+    'check_stage_hint',
+    'geo_focus',
+    'avoid_or_out_of_scope',
+  ];
+  const out = { ...obj };
+  for (const k of strKeys) {
+    if (out[k] != null && typeof out[k] === 'string') out[k] = cleanThesisTextField(out[k]);
+  }
+  if (Array.isArray(out.notable_portfolio)) {
+    out.notable_portfolio = out.notable_portfolio.map(cleanThesisPortfolioEntry).filter(Boolean);
+  }
+  return out;
 }
 
 function thesisWorthShowingInUi(raw) {
@@ -879,14 +928,15 @@ Return ONE JSON object with these keys only (all strings except notable_portfoli
 - geo_focus (regions they emphasize, else "unknown")
 - avoid_or_out_of_scope (sectors/stages they say they avoid, else "")
 
-If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
+Rules: If the page is mostly nav menus, set sector_focus to "unknown" — do not write "navigation" as a sector. Never put meta-phrases ("cautious inference", "not explicitly stated", long sentences) in any string field. notable_portfolio: short company names only, never editorial notes.`;
 
   const sys = 'You extract VC investment thesis from website copy. Valid JSON only.';
 
   try {
     const o = await groqJson(user, sys, true, 2048);
     if (o && typeof o === 'object') {
-      if (thesisDataSubstantive(o)) return { ...o, firm_name: o.firm_name || firmName };
+      const c = cleanExtractedThesis(o);
+      if (thesisDataSubstantive(c)) return { ...c, firm_name: c.firm_name || firmName };
     }
   } catch {
     /* try plain completion */
@@ -902,8 +952,9 @@ If the page is mostly navigation, infer cautiously and say so in sector_focus.`;
       2048
     );
     const o = parseJsonLoose(raw);
-    if (o && typeof o === 'object' && thesisDataSubstantive(o)) {
-      return { ...o, firm_name: o.firm_name || firmName };
+    if (o && typeof o === 'object') {
+      const c = cleanExtractedThesis(o);
+      if (thesisDataSubstantive(c)) return { ...c, firm_name: c.firm_name || firmName };
     }
   } catch {
     /* ignore */
