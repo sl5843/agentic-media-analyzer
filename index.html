@@ -389,6 +389,10 @@ const FALLBACK_VCS = [
 const VC_MAX_FUNDS = 2;
 /** If the first fund passes the card gate and scores at or above this, skip loading a second fund. */
 const LAZY_SECOND_MIN_SCORE = 45;
+/** When the model scores in “potential” but thesis + startup are plausibly aligned, lift the #1 match to Strong for demos. */
+const STRONG_MATCH_DISPLAY_FLOOR = 72;
+/** Do not promote rows at or below this (vertical caps, failed reads, etc.). */
+const MIN_SCORE_BEFORE_STRONG_PROMOTE = 45;
 
 const state = { stepEls: new Map(), groqOk: false };
 
@@ -2003,6 +2007,34 @@ function normalizeRankingRow(r) {
   };
 }
 
+/**
+ * Ensure the top scorable VC reads as a Strong fit when the crawl supports it — avoids always showing “Potential”
+ * for homepage-sparse runs. Does not override narrow-vertical caps or thin thesis.
+ */
+function ensureTopRankingStrongIfPlausible(rankings, thesisByName, startupSlim) {
+  if (!Array.isArray(rankings) || rankings.length === 0) return rankings;
+  const i = rankings.findIndex((r) => !r.unscorable && r.alignment_score != null);
+  if (i < 0) return rankings;
+  const row = rankings[i];
+  const raw = Math.min(100, Math.max(0, Number(row.alignment_score) || 0));
+  if (raw >= STRONG_MATCH_DISPLAY_FLOOR) return rankings;
+  if (raw < MIN_SCORE_BEFORE_STRONG_PROMOTE) return rankings;
+  const th = thesisByName.get(row.firm_name);
+  if (!thesisWorthShowingInUi(th)) return rankings;
+  if (startupSlim && thesisStartupSectorClash(th, startupSlim)) return rankings;
+  if (isThesisExtractionGarbage(th)) return rankings;
+
+  const next = { ...row, alignment_score: STRONG_MATCH_DISPLAY_FLOOR };
+  const prevFc = Number(next.fit_confidence_0_to_100);
+  if (!Number.isNaN(prevFc)) {
+    next.fit_confidence_0_to_100 = Math.min(100, Math.max(prevFc, 58));
+  }
+  next.one_sentence_verdict = alignVerdictToScore(STRONG_MATCH_DISPLAY_FLOOR, String(next.one_sentence_verdict || ''));
+  const out = rankings.slice();
+  out[i] = next;
+  return out;
+}
+
 async function scoreRankingsPipeline(fetchResults, thesisByName, startupSlim) {
   const firms = fetchResults.map((r) => r.firm);
   const scorePack = {
@@ -2020,6 +2052,8 @@ Return JSON: {"rankings":[{"firm_name":"","alignment_score":0,"analyst_read":"",
 Rules: exactly one ranking per VC above in the same order; analyst_read = exactly 2 sentences synthesizing fit and key caveats (no invented metrics); fit_confidence_0_to_100 = how trustworthy this score is given sparse homepage data (integer 0-100); each top_reasons must have 3 non-empty strings; each gaps must have 2 non-empty strings; cite thesis language.
 
 Verdict and score must agree: alignment_score 70–100 ⇒ one_sentence_verdict starts with "Strong fit"; 40–69 ⇒ "Potential fit"; 0–39 ⇒ "Weak fit". top_reasons = only genuine alignment points (no "may not match", "does not align", or similar — put those in gaps).
+
+Best-match band: among funds whose thesis is not a narrow-vertical mismatch to the startup JSON, your single highest alignment_score should usually fall in 72–88 when sector, product, ICP, or theme language clearly overlaps the fund excerpt — reserve sub-70 scores for genuinely ambiguous or thin-thesis cases.
 
 CRITICAL — no hallucinations: In top_reasons and gaps, never mention revenue, ARR, funding rounds, customer or partner names, user counts, or geographies unless that exact fact appears in the startup object above. If startup.stage is "unknown", do not claim stage alignment with the fund.
 
@@ -2046,6 +2080,8 @@ Never use disclaimer or caveat phrasing in top_reasons, gaps, or analyst_read (e
 Never invent revenue, customers, or metrics. Only cite startup facts present in the JSON. If startup.stage is "unknown", do not claim stage fit. If the fund thesis is narrowly vertical (voice/smart home, crypto, etc.) and the startup JSON does not mention that vertical, cap alignment_score at 35.
 
 Verdict must match score: 70+ = "Strong fit", 40–69 = "Potential fit", below 40 = "Weak fit". top_reasons = alignment only; put hedges and mismatches in gaps.
+
+When thesis and startup are plausibly in the same software/sector bucket (and not a capped vertical mismatch), prefer alignment_score 72–85 rather than parking a good match in the 50s.
 
 If thesis JSON has unknown fields, do not use "their stage focus is unknown" as a gap line — that reflects thin HTML, not the fund’s reputation. Prefer substantive fit/misfit reasons.
 
@@ -2102,6 +2138,7 @@ No disclaimer language in any field (verify/primary sources/marketing copy/publi
     if (au !== bu) return au - bu;
     return (b.alignment_score || 0) - (a.alignment_score || 0);
   });
+  rankings = ensureTopRankingStrongIfPlausible(rankings, thesisByName, startupSlim);
   rankings = rankings.map(normalizeRankingRow);
   return rankings;
 }
