@@ -1176,12 +1176,9 @@ function dedupeStringsPreserveOrder(arr) {
   return out;
 }
 
-/** Model often writes “Sequoia’s stage is unknown” — sounds silly; unknown = missing from scrape, not missing from Earth. */
+/** Drop “Firm X’s stage is unknown” style lines — unknown = missing from scrape, not a real gap. */
 function scrubVacuousThesisUnknownGaps(gapList) {
-  const GAP_REPLACE =
-    'Stage and founder criteria often aren’t on the few pages we pulled for this report, so those fields may show as unknown — that’s a coverage limit here, not a judgment on the fund. Use their site, memos, and recent deals for how they actually invest.';
   const out = [];
-  let replacedOnce = false;
   for (const g of gapList) {
     const s = String(g || '').trim();
     if (
@@ -1190,10 +1187,6 @@ function scrubVacuousThesisUnknownGaps(gapList) {
       ) ||
       (/\bunknown\b/i.test(s) && /stage focus|founder signals/i.test(s) && /capital|ventures|partners|fund/i.test(s))
     ) {
-      if (!replacedOnce) {
-        out.push(GAP_REPLACE);
-        replacedOnce = true;
-      }
       continue;
     }
     out.push(s);
@@ -1825,7 +1818,7 @@ Rules: exactly one ranking per VC above in the same order; analyst_read = exactl
 
 CRITICAL — no hallucinations: In top_reasons and gaps, never mention revenue, ARR, funding rounds, customer or partner names, user counts, or geographies unless that exact fact appears in the startup object above. If startup.stage is "unknown", do not claim stage alignment with the fund.
 
-If thesis fields show "unknown" (e.g. stage_focus, founder_signals), that means the scraped homepage did not contain that text — do NOT write gaps like "Firm X’s stage focus is unknown" as if it were surprising or a knock on famous funds. Use real misalignment or product/thesis tension instead; at most one gap may note the scrape limitation briefly.
+If thesis fields show "unknown" (e.g. stage_focus, founder_signals), do not mention that in gaps — use two substantive diligence items (real misalignment, missing proof, sector/stage checks) instead. Never write "Firm X’s stage focus is unknown" style lines.
 
 If the fund thesis centers on a narrow vertical (e.g. voice assistants, smart home, crypto, defense) and the startup JSON does not mention that vertical, alignment_score must be at most 35 and gaps must state the mismatch clearly.`;
 
