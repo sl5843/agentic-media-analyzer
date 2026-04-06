@@ -648,33 +648,52 @@ async function groqCompleteRetry(
   throw lastErr;
 }
 
-/** Drop vague traction (e.g. “Backed by investors” with no names or amounts). */
-function isConcreteTractionLine(s) {
+/** Lines that attribute capital to people/funds (belong in named_investors only, not traction/skim). */
+function isInvestorAttributionLine(s) {
+  return /\b(backed by|funded by|funding from|investment from|investors?\s+include|led (?:the )?(?:round |series )?by)\b/i.test(
+    String(s || '')
+  );
+}
+
+/** Traction/skim: metrics, usage, product — never investor attribution (those go in named_investors only). */
+function isConcreteNonInvestorTractionLine(s) {
   const t = String(s || '').trim();
-  if (!t) return false;
+  if (!t || isInvestorAttributionLine(t)) return false;
   const low = t.toLowerCase();
-  if (/^backed by investors?$/.test(low)) return false;
-  if (/\bbacked by investors?\b/.test(low) && !/[0-9]/.test(t)) return false;
-  if (/^backed by\b/i.test(t)) {
-    const after = t.replace(/^backed by\s+/i, '').trim();
-    if (!after || /^(investors?|angels?|vcs?)$/i.test(after)) return false;
-  }
+  if (/\b(backed by|funded by)\s+(partners?|customers?|integrations?|clients?)\b/i.test(low)) return false;
   if (/\b(funded|raised|backing)\b/i.test(low) && !/[0-9$]/.test(t) && !/\b(series|seed|pre-?seed|round)\b/i.test(low)) {
-    if (!/\b(led by|from [A-Z]|[A-Z][a-z]+ (Capital|Ventures|Partners))\b/.test(t)) return false;
+    return false;
   }
   return true;
 }
 
+function normalizeNamedInvestorsList(raw) {
+  if (raw == null) return [];
+  const arr = Array.isArray(raw) ? raw : String(raw).split(/[,;]+/);
+  const out = [];
+  const seen = new Set();
+  for (const x of arr) {
+    const n = String(x || '').trim();
+    if (n.length < 2 || n.length > 120) continue;
+    const k = n.toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(n);
+    if (out.length >= 16) break;
+  }
+  return out;
+}
+
 function filterTractionSignalsForDisplay(raw) {
   const list = Array.isArray(raw) ? raw : String(raw || '').split(/[;,\n]+/).map((x) => x.trim()).filter(Boolean);
-  return list.filter(isConcreteTractionLine);
+  return list.filter(isConcreteNonInvestorTractionLine);
 }
 
 function filterSkimBulletsForDisplay(bullets) {
   return (Array.isArray(bullets) ? bullets : [])
     .map((x) => String(x || '').trim())
     .filter(Boolean)
-    .filter(isConcreteTractionLine);
+    .filter(isConcreteNonInvestorTractionLine);
 }
 
 function slimStartupForLlm(s) {
@@ -685,6 +704,7 @@ function slimStartupForLlm(s) {
   const founders = Array.isArray(fts) ? fts.slice(0, 4).join('; ') : String(fts || '').slice(0, 300);
   const oq = s.open_questions_for_investors;
   const questions = Array.isArray(oq) ? oq.slice(0, 5).join(' | ') : String(oq || '').slice(0, 400);
+  const namedInvestors = normalizeNamedInvestorsList(s.named_investors);
   return {
     company_name: String(s.company_name || '').slice(0, 120),
     one_line_description: String(s.one_line_description || '').slice(0, 500),
@@ -694,6 +714,7 @@ function slimStartupForLlm(s) {
     key_differentiator: String(s.key_differentiator || '').slice(0, 500),
     target_customer: String(s.target_customer || '').slice(0, 400),
     traction_signals: traction.slice(0, 500),
+    named_investors: namedInvestors,
     founding_team_signals: founders.slice(0, 400),
     icp_summary: String(s.icp_summary || '').slice(0, 400),
     product_surface: String(s.product_surface || '').slice(0, 200),
@@ -1401,6 +1422,46 @@ function wordOverlapRatio(a, b) {
   return inter / Math.min(wa.size, wb.size);
 }
 
+function pitchOpeningTooCloseToTagline(hook, startupSlim) {
+  const h = String(hook || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (h.length < 18) return false;
+  const blobs = [
+    String(startupSlim.one_line_description || ''),
+    String(startupSlim.key_differentiator || ''),
+  ]
+    .map((x) => x.toLowerCase().replace(/\s+/g, ' ').trim())
+    .filter((x) => x.length > 18);
+  for (const t of blobs) {
+    if (wordOverlapRatio(h, t) > 0.5) return true;
+    if (t.length >= 32 && h.includes(t.slice(0, Math.min(48, t.length)))) return true;
+    if (h.length >= 32 && t.includes(h.slice(0, Math.min(48, h.length)))) return true;
+  }
+  return false;
+}
+
+/** One sentence: startup wedge + VC thesis hook (not the website tagline). */
+function buildThesisLedOpeningSentence(startupSlim, vcFirmName, thesisPack) {
+  const vc = String(vcFirmName || 'this fund').trim();
+  const cn = String(startupSlim.company_name || 'We').trim();
+  const rawChip = String(
+    thesisPack?.themes_or_trends || thesisPack?.sector_focus || thesisPack?.product_signals || ''
+  ).trim();
+  const chipPick =
+    rawChip
+      .split(/[;,•]/)
+      .map((x) => x.trim())
+      .filter(Boolean)[0] || 'their stated mandate';
+  const chip = chipPick.slice(0, 110);
+  const ps = String(startupSlim.product_surface || '').trim();
+  const icp = String(startupSlim.icp_summary || startupSlim.target_customer || '').trim();
+  const wedge =
+    String(startupSlim.competitive_angle || '').trim() ||
+    (ps && icp ? `${ps} for ${icp}` : ps || icp) ||
+    String(startupSlim.key_differentiator || '').slice(0, 130);
+  const w = wedge || 'the product story in the profile';
+  return `${cn} delivers ${w}, aligning with ${vc}’s focus on ${chip}.`.replace(/\s+/g, ' ').slice(0, 340);
+}
+
 /** Collapse near-duplicate gap lines (same mismatch stated twice). */
 function dedupeNearDuplicateGaps(gapList) {
   const items = gapList.map((x) => String(x || '').trim()).filter(Boolean);
@@ -1583,24 +1644,22 @@ function thesisDigestHtml(firmName, thesisByName) {
 const PITCH_HYPE_RE =
   /\b(revolutioniz|cutting-?edge|game-?chang|world-?class|industry[- ]leading|market[- ]leading|excited to explore|thrilled to)\b/i;
 
-function scrubPitchOpeningHype(hook, startupSlim) {
+function scrubPitchOpeningHype(hook, startupSlim, vcFirmName, thesisPack) {
   const h = String(hook || '').trim();
   if (!PITCH_HYPE_RE.test(h)) return h;
-  const cn = String(startupSlim.company_name || 'This company').trim();
-  const ol = String(startupSlim.one_line_description || '').trim();
-  const kd = String(startupSlim.key_differentiator || '').trim();
-  if (ol) return `${cn}: ${ol}`.slice(0, 320);
-  if (kd) return `${cn} — ${kd}`.slice(0, 320);
-  return `${cn} (${startupSlim.sector || 'see JSON'}) — ${startupSlim.product_surface || 'product'} for ${startupSlim.target_customer || 'buyers'}`.slice(
-    0,
-    320
-  );
+  return buildThesisLedOpeningSentence(startupSlim, vcFirmName, thesisPack);
 }
 
-function sanitizeStructuredPitch(obj, startupSlim, vcFirmName) {
-  const corpusLower = `${jsonCorpusLower(startupSlim)}\n${String(vcFirmName || '').toLowerCase()}`;
+function sanitizeStructuredPitch(obj, startupSlim, vcFirmName, thesisPack) {
+  const corpusLower = `${jsonCorpusLower(startupSlim)}\n${jsonCorpusLower(thesisPack || {})}\n${String(
+    vcFirmName || ''
+  ).toLowerCase()}`;
   let hook = sanitizeFreeText(String(obj?.opening_hook || ''), corpusLower);
-  hook = scrubPitchOpeningHype(hook, startupSlim);
+  hook = scrubPitchOpeningHype(hook, startupSlim, vcFirmName, thesisPack);
+  if (!String(hook || '').trim() || pitchOpeningTooCloseToTagline(hook, startupSlim)) {
+    hook = buildThesisLedOpeningSentence(startupSlim, vcFirmName, thesisPack);
+    hook = sanitizeFreeText(hook, corpusLower) || hook;
+  }
   const bridge = sanitizeFreeText(String(obj?.thesis_bridge || ''), corpusLower);
   const proofs = (Array.isArray(obj?.proof_points) ? obj.proof_points : [])
     .map((s) => sanitizeFreeText(String(s || ''), corpusLower))
@@ -1887,12 +1946,13 @@ async function runPipeline(startupUrl, resolveNote = '') {
   • Use public only if the excerpt clearly indicates a publicly traded company.
   • Use unknown if you cannot place the company confidently from the excerpt.
 - business_model, key_differentiator, target_customer
-- traction_signals (string or array): ONLY concrete facts from the excerpt — user counts, revenue/ARR if stated, named customers, named investors, growth %, logos with numbers. NEVER output vague lines like "Backed by investors", "Backed by VCs", or "has funding" without a named party or numeric detail. Omit entirely if nothing concrete.
+- named_investors: JSON array of strings — ONLY entities the excerpt explicitly names as investors, backers, or funders of THIS operating company (e.g. "Series A led by Acme Ventures", "backed by Jane Doe and XYZ Capital"). MUST be [] if you cannot name specific investors. NEVER put customers, integration partners, "trusted by" logos, enterprise users, or tech partners here even if logos appear on the page. When in doubt, use [].
+- traction_signals (string or array): product and business metrics ONLY — user counts, revenue/ARR if stated, growth %, usage stats. Do NOT include any "backed by", "funded by", "led by", investor names, or funding attribution here (that belongs only in named_investors). Do NOT treat partner or customer logos as investors. Omit lines if nothing fits.
 - icp_summary: one sentence on who buys / primary user (or "")
 - product_surface: how they ship (e.g. web app, mobile, API, platform) — infer from excerpt or ""
 - competitive_angle: how they position vs alternatives using ONLY cues in the excerpt (no invented competitor names)
 - open_questions_for_investors: array of 3–4 short strings — important unknowns an investor would still need to diligence (missing from page)
-- investor_skim_bullets: array of exactly 3 punchy lines; ONLY concrete facts (same bar as traction_signals). No generic "backed by investors" without names.
+- investor_skim_bullets: array of exactly 3 punchy lines — product, ICP, traction metrics, positioning. NEVER claim investors or funding here; no "backed by" unless those exact names also appear in named_investors (prefer to omit backer talk from bullets entirely).
 
 Use unknown or "" or [] if missing.
 
@@ -1934,6 +1994,11 @@ Excerpt:
     `${startup.company_name || 'Company'} · ${startup.sector || 'sector TBD'}`
   );
 
+  const namedInvestorsDisplay = normalizeNamedInvestorsList(startup.named_investors);
+  const backersBlock =
+    namedInvestorsDisplay.length > 0
+      ? `<p class="snapshot-detail"><strong>Backed by:</strong> ${esc(namedInvestorsDisplay.join(', ').slice(0, 500))}</p>`
+      : '';
   const skimBullets = filterSkimBulletsForDisplay(startup.investor_skim_bullets).slice(0, 3);
   const skimHtml =
     skimBullets.length > 0
@@ -1978,7 +2043,7 @@ Excerpt:
         <div><dt>Target customer</dt><dd>${esc(startup.target_customer || '—')}</dd></div>
       </dl>
       <p style="margin-top:0.75rem"><strong>Differentiator:</strong> ${esc(startup.key_differentiator || '—')}</p>
-      ${icpBlock}${surfaceBlock}${compBlock}${tractionBlock}${foundersBlock}
+      ${backersBlock}${icpBlock}${surfaceBlock}${compBlock}${tractionBlock}${foundersBlock}
       ${skimHtml}
       ${oqBlock}
       <p class="evidence" style="margin-top:0.65rem">${
@@ -2375,12 +2440,16 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
   let pitchBodyHtml = '';
   if (topFirm && topThesis) {
     const thesisPitchPack = slimThesisForLlm(topThesis);
-    const pitchJsonUser = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis:\n${JSON.stringify(thesisPitchPack)}\n\nReturn JSON only with keys: opening_hook (string, 1–2 sentences), thesis_bridge (string, 3–5 sentences), proof_points (array of exactly 3 non-empty strings; each line must cite ONLY facts from Startup JSON), diligence_gaps (array of exactly 2 non-empty strings).\n\nBe specific and actionable (no generic "we are a software company" openers):\n- opening_hook: Name the VC once, name the startup once, quote or closely paraphrase ONE concrete string from Thesis (e.g. sector_focus, themes_or_trends, or product_signals) and tie it to ONE concrete Startup field (e.g. product_surface, icp_summary, key_differentiator, competitive_angle).\n- thesis_bridge: For each sentence, pair one Startup JSON field with one Thesis field by name (e.g. "Your themes_or_trends on X → our key_differentiator on Y"). At least two such pairings.\n- proof_points: Three bullets, each a single factual clause from Startup JSON (traction, ICP, product, positioning).\n- diligence_gaps: Two sharp product or go-to-market questions (e.g. deployment model, buyer workflow, why now) — not "verify the deck" or "check the website".\n\nRules: no revenue, customer names, funding rounds, or geographies unless they appear in the Startup JSON. No hype words ("revolutionizing", "cutting-edge") unless they appear verbatim in Startup JSON.`;
+    const pitchJsonUser = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis:\n${JSON.stringify(thesisPitchPack)}\n\nReturn JSON only with keys: opening_hook (string, EXACTLY ONE sentence), thesis_bridge (string, 3–5 sentences), proof_points (array of exactly 3 non-empty strings; each line must cite ONLY facts from Startup JSON), diligence_gaps (array of exactly 2 non-empty strings).\n\nopening_hook rules (critical):\n- ONE sentence only.\n- Do NOT repeat, copy, or paraphrase one_line_description or the website tagline.\n- Must connect (a) a specific startup capability from competitive_angle, product_surface, icp_summary, or traction_signals to (b) a specific string from Thesis JSON (themes_or_trends, sector_focus, product_signals, or stage_focus). Name the VC once and the startup once.\n\nthesis_bridge: Each sentence pairs one Startup JSON field with one Thesis field by name. At least two pairings.\nproof_points: Three factual clauses from Startup JSON (no named_investors unless pitching that list).\ndiligence_gaps: Two sharp product or GTM questions.\n\nRules: no revenue, customer names, funding rounds, or geographies unless they appear in the Startup JSON. No hype unless verbatim in Startup JSON.`;
     try {
       const po = await groqJson(pitchJsonUser, 'JSON only.', true, 2048);
-      let cleaned = sanitizeStructuredPitch(po, startupSlim, topFirm.firm_name);
+      let cleaned = sanitizeStructuredPitch(po, startupSlim, topFirm.firm_name, thesisPitchPack);
+      let oh = isDisclaimerLine(cleaned.opening_hook) ? '' : cleaned.opening_hook;
+      if (!String(oh || '').trim() || pitchOpeningTooCloseToTagline(oh, startupSlim)) {
+        oh = buildThesisLedOpeningSentence(startupSlim, topFirm.firm_name, thesisPitchPack);
+      }
       cleaned = {
-        opening_hook: isDisclaimerLine(cleaned.opening_hook) ? '' : cleaned.opening_hook,
+        opening_hook: oh,
         thesis_bridge: isDisclaimerLine(cleaned.thesis_bridge) ? '' : cleaned.thesis_bridge,
         proof_points: filterDisclaimerFromStrings(cleaned.proof_points || []),
         diligence_gaps: filterDisclaimerFromStrings(cleaned.diligence_gaps || []),
@@ -2396,7 +2465,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
       try {
         const pitchRaw = await groqCompleteRetry(
           `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis (compact):\n${JSON.stringify(thesisPitchPack)}\n\nWrite ONE paragraph only.`,
-          'You are a startup pitch coach. Use ONLY facts present in the Startup JSON above. Do not invent revenue figures, customer names, funding, or geographies. Based on this VC thesis and startup facts, write one paragraph on how to angle the pitch; reference the VC’s stated language. No bullet points.',
+          'You are a startup pitch coach. Use ONLY facts in the Startup JSON. One paragraph: connect a concrete startup capability (not the tagline alone) to this VC’s thesis themes. No bullet points.',
           false,
           4,
           768
