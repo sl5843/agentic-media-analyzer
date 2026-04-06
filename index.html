@@ -1179,7 +1179,7 @@ function dedupeStringsPreserveOrder(arr) {
 /** Model often writes “Sequoia’s stage is unknown” — sounds silly; unknown = missing from scrape, not missing from Earth. */
 function scrubVacuousThesisUnknownGaps(gapList) {
   const GAP_REPLACE =
-    'The thesis summary shows “unknown” because this fund’s homepage text did not state that dimension in our scrape — not because the firm has no strategy. Check their site, memos, and recent deals for stage and founder criteria.';
+    'Stage and founder criteria often aren’t on the few pages we pulled for this report, so those fields may show as unknown — that’s a coverage limit here, not a judgment on the fund. Use their site, memos, and recent deals for how they actually invest.';
   const out = [];
   let replacedOnce = false;
   for (const g of gapList) {
