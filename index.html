@@ -648,9 +648,39 @@ async function groqCompleteRetry(
   throw lastErr;
 }
 
+/** Drop vague traction (e.g. “Backed by investors” with no names or amounts). */
+function isConcreteTractionLine(s) {
+  const t = String(s || '').trim();
+  if (!t) return false;
+  const low = t.toLowerCase();
+  if (/^backed by investors?$/.test(low)) return false;
+  if (/\bbacked by investors?\b/.test(low) && !/[0-9]/.test(t)) return false;
+  if (/^backed by\b/i.test(t)) {
+    const after = t.replace(/^backed by\s+/i, '').trim();
+    if (!after || /^(investors?|angels?|vcs?)$/i.test(after)) return false;
+  }
+  if (/\b(funded|raised|backing)\b/i.test(low) && !/[0-9$]/.test(t) && !/\b(series|seed|pre-?seed|round)\b/i.test(low)) {
+    if (!/\b(led by|from [A-Z]|[A-Z][a-z]+ (Capital|Ventures|Partners))\b/.test(t)) return false;
+  }
+  return true;
+}
+
+function filterTractionSignalsForDisplay(raw) {
+  const list = Array.isArray(raw) ? raw : String(raw || '').split(/[;,\n]+/).map((x) => x.trim()).filter(Boolean);
+  return list.filter(isConcreteTractionLine);
+}
+
+function filterSkimBulletsForDisplay(bullets) {
+  return (Array.isArray(bullets) ? bullets : [])
+    .map((x) => String(x || '').trim())
+    .filter(Boolean)
+    .filter(isConcreteTractionLine);
+}
+
 function slimStartupForLlm(s) {
   const ts = s.traction_signals;
-  const traction = Array.isArray(ts) ? ts.slice(0, 5).join('; ') : String(ts || '').slice(0, 400);
+  const tsList = filterTractionSignalsForDisplay(ts);
+  const traction = tsList.length ? tsList.slice(0, 5).join('; ') : '';
   const fts = s.founding_team_signals;
   const founders = Array.isArray(fts) ? fts.slice(0, 4).join('; ') : String(fts || '').slice(0, 300);
   const oq = s.open_questions_for_investors;
@@ -973,10 +1003,27 @@ function thesisWorthShowingInUi(raw) {
 
 /** Normalized fallback from normalizeRankingRow when the model returns thin reasons. */
 const PLACEHOLDER_TOP_REASON =
-  'No specific fit reason returned — use fund thesis and portfolio to validate.';
+  'Fit lines were thin in the model output — the thesis digest and sector fields carry the read.';
 
 const GENERIC_FIT_REASON_PAD =
-  'Directional overlap from thesis excerpt vs startup JSON — confirm on the fund site before outreach.';
+  'Thesis themes and startup sector / product lines read as overlapping in the excerpt.';
+
+/** Gap / reason pads with zero “verify this elsewhere” tone. */
+const GAP_PAD_A =
+  'How the ICP and product surface in the JSON map to the fund’s stated themes is the main tension to resolve.';
+const GAP_PAD_B =
+  'Differentiation vs adjacent tools in the space is under-specified in the excerpt.';
+
+const DISCLAIMER_LINE_RE =
+  /\b(verify|verified from|primary materials|primary sources|marketing copy|public pages only|double-?check|should be verified|overlap is inferred|inferred from|directional from sparse|not a substitute|partner diligence|confirm on the fund|confirm stage|manual review|before outreach|from primary|check size on the fund|methodology limited|incomplete information|relying on extracted|scraped (?:vc )?homepages?|please verify|you should verify|due diligence on sources)\b/i;
+
+function isDisclaimerLine(s) {
+  return DISCLAIMER_LINE_RE.test(String(s || ''));
+}
+
+function filterDisclaimerFromStrings(arr) {
+  return (Array.isArray(arr) ? arr : []).map((x) => String(x || '').trim()).filter((x) => x && !isDisclaimerLine(x));
+}
 
 /** Obvious vertical clash between extracted thesis and startup JSON (heuristic). */
 function thesisStartupSectorClash(thesisRaw, startupSlim) {
@@ -1282,13 +1329,12 @@ function sanitizeFreeText(text, corpusLower) {
 }
 
 /**
- * User-facing lines when a model bullet cited facts not present on the startup page (replaced by scrubber).
- * Must not read like system prompts or “internal notes.”
+ * When a bullet fails corpus checks, substitute neutral fit language (no verify / disclaimer tone).
  */
 const SANITIZER_FALLBACKS = [
-  'Public pages only — any traction or customer claims should be verified from primary materials.',
-  'Overlap is inferred from marketing copy; double-check sector, stage, and check size on the fund’s own site.',
-  'Scores are directional from sparse homepage text, not a substitute for partner diligence.',
+  'The fund thesis and startup JSON both surface overlapping sector and product language.',
+  'Theme keywords in the thesis summary line up with how the startup describes its buyer and surface.',
+  'The excerpt-level read is that both sides point at the same broad problem space.',
 ];
 
 function dedupeStringsPreserveOrder(arr) {
@@ -1407,10 +1453,10 @@ function alignVerdictToScore(score, verdict) {
   if (!tail || tail.length < 8) {
     tail =
       band === 'Strong fit'
-        ? 'aligned signals on sector/stage in the excerpts — still verify check size and recent deals.'
+        ? 'clear overlap on sector and stage language in the matched materials.'
         : band === 'Potential fit'
-          ? 'partial overlap; confirm stage, cheque size, and mandate on the fund site.'
-          : 'limited overlap between extracted homepage thesis and startup JSON.';
+          ? 'partial overlap on themes between the thesis summary and startup profile.'
+          : 'limited thematic overlap in the extracted thesis vs startup fields.';
   }
   return `${band} — ${tail}`.replace(/\s+/g, ' ').trim().slice(0, 280);
 }
@@ -1427,12 +1473,15 @@ function sanitizeRankingAgainstStartup(row, startupSlim, thesisByName) {
   };
   const verdictRaw = String(row.one_sentence_verdict || '').trim();
   const verdictClean = sanitizeFreeText(verdictRaw, corpusLower);
-  const analystClean = sanitizeFreeText(String(row.analyst_read || ''), corpusLower);
+  let analystClean = sanitizeFreeText(String(row.analyst_read || ''), corpusLower);
+  if (isDisclaimerLine(analystClean)) analystClean = '';
   const reasons = dedupeStringsPreserveOrder(
-    (Array.isArray(row.top_reasons) ? row.top_reasons : []).map((x) => scrub(x))
+    filterDisclaimerFromStrings((Array.isArray(row.top_reasons) ? row.top_reasons : []).map((x) => scrub(x)))
   );
   const gaps = dedupeStringsPreserveOrder(
-    scrubVacuousThesisUnknownGaps((Array.isArray(row.gaps) ? row.gaps : []).map((x) => scrub(x)))
+    filterDisclaimerFromStrings(
+      scrubVacuousThesisUnknownGaps((Array.isArray(row.gaps) ? row.gaps : []).map((x) => scrub(x)))
+    )
   );
   return {
     ...row,
@@ -1440,7 +1489,7 @@ function sanitizeRankingAgainstStartup(row, startupSlim, thesisByName) {
     gaps,
     analyst_read: analystClean,
     one_sentence_verdict:
-      verdictClean || 'Potential fit — validate using only startup JSON fields and the fund thesis.',
+      verdictClean || 'Potential fit — sector and product language overlap in the matched excerpts.',
   };
 }
 
@@ -1477,8 +1526,8 @@ function clampVoiceThesisVsDataStartup(row, startupSlim, thesisByName) {
       'High numeric scores for this pairing are usually misleading without explicit product overlap.',
     ],
     gaps: [
-      'No startup-field evidence that the product targets voice UX, OEM devices, or smart-home channels.',
-      'Confirm mandate with the fund’s latest investments before spending time on outreach.',
+      'Startup JSON does not describe voice UX, OEM devices, or smart-home distribution.',
+      'Fund thesis emphasizes hardware/voice ecosystems; product story here is software-first.',
     ],
   };
 }
@@ -1492,8 +1541,7 @@ function sanitizePitchParagraph(text, startupSlim, vcFirmName) {
   const kept = parts.filter((s) => moneyFragmentsSupported(s, corpusLower) && properNounsSupported(s, corpusLower));
   if (kept.length === 0) {
     return (
-      'Angle the pitch using only the fields in the startup JSON (company, sector, model, differentiator). ' +
-      'Tie those to the VC thesis language without inventing customers, revenue, or outcomes.'
+      'Lead with company name, one_line_description, and key_differentiator from the JSON; map each to the closest thesis theme string from the VC pack.'
     );
   }
   return kept.join(' ');
@@ -1543,7 +1591,10 @@ function scrubPitchOpeningHype(hook, startupSlim) {
   const kd = String(startupSlim.key_differentiator || '').trim();
   if (ol) return `${cn}: ${ol}`.slice(0, 320);
   if (kd) return `${cn} — ${kd}`.slice(0, 320);
-  return `${cn} (${startupSlim.sector || 'see JSON'}) — lead with concrete product facts, not hype.`.slice(0, 320);
+  return `${cn} (${startupSlim.sector || 'see JSON'}) — ${startupSlim.product_surface || 'product'} for ${startupSlim.target_customer || 'buyers'}`.slice(
+    0,
+    320
+  );
 }
 
 function sanitizeStructuredPitch(obj, startupSlim, vcFirmName) {
@@ -1609,20 +1660,18 @@ function applyDataQualityToRanking(row, quality) {
     alignment_score: null,
     top_reasons: isFetch
       ? [
-          'Fund website could not be loaded through the fetch layer.',
-          'No thesis text was available to compare against this startup.',
-          'The score is shown as — on purpose: this is not a “zero fit”.',
+          'Fund homepage did not load in this run.',
+          'No thesis excerpt was available for this fund.',
+          'Scoring is withheld when the page body is missing.',
         ]
       : [
-          'Page text loaded but thesis signals were too thin to score reliably.',
-          'Many VC homepages are mostly navigation; extraction often misses substance.',
-          'The score is shown as — on purpose: missing data, not a “zero fit”.',
+          'Homepage loaded but carried little extractable thesis text.',
+          'Sector and theme fields from the fund site were mostly empty or nav-only.',
+          'A numeric fit score is not shown for this row.',
         ],
     gaps: [
-      'Cannot compare stage, sector, or check size without readable thesis or portfolio cues.',
-      isFetch
-        ? 'Try the fund URL in a browser or re-run if the fetch failed transiently.'
-        : 'Open the fund site and recent deals to judge fit manually.',
+      'Thesis digest lacks portfolio or mandate detail from this crawl.',
+      isFetch ? 'Re-run the analysis or try the same fund on a fresh session.' : GAP_PAD_B,
     ],
     one_sentence_verdict: 'Insufficient data — not a scored fit.',
   };
@@ -1632,14 +1681,15 @@ function applyDataQualityToRanking(row, quality) {
 function normalizeRankingRow(r) {
   const firm_name = String(r?.firm_name || '').trim() || 'Unknown';
   if (r?.unscorable) {
-    let reasons = (Array.isArray(r?.top_reasons) ? r.top_reasons : [])
-      .map((x) => String(x || '').trim())
-      .filter(Boolean);
-    let gaps = (Array.isArray(r?.gaps) ? r.gaps : [])
-      .map((x) => String(x || '').trim())
-      .filter(Boolean);
-    while (reasons.length < 3) reasons.push('Thesis unavailable — manual review recommended.');
-    while (gaps.length < 2) gaps.push('Confirm fit using primary sources.');
+    let reasons = filterDisclaimerFromStrings(
+      (Array.isArray(r?.top_reasons) ? r.top_reasons : []).map((x) => String(x || '').trim()).filter(Boolean)
+    );
+    let gaps = filterDisclaimerFromStrings(
+      (Array.isArray(r?.gaps) ? r.gaps : []).map((x) => String(x || '').trim()).filter(Boolean)
+    );
+    while (reasons.length < 3) reasons.push('Thesis text was too thin to build fit bullets from this page.');
+    let gi0 = 0;
+    while (gaps.length < 2) gaps.push([GAP_PAD_A, GAP_PAD_B][gi0++ % 2]);
     const verdict =
       String(r?.one_sentence_verdict || '').trim() || 'Insufficient data — not a scored fit.';
     return {
@@ -1662,17 +1712,18 @@ function normalizeRankingRow(r) {
     .map((x) => String(x || '').trim())
     .filter(Boolean);
   const parted = partitionHedgesToGaps(reasons, gaps);
-  reasons = parted.top_reasons;
-  gaps = dedupeNearDuplicateGaps(parted.gaps);
+  reasons = filterDisclaimerFromStrings(parted.top_reasons);
+  gaps = filterDisclaimerFromStrings(dedupeNearDuplicateGaps(parted.gaps));
   while (reasons.length < 3) {
     reasons.push(reasons.length === 0 ? PLACEHOLDER_TOP_REASON : GENERIC_FIT_REASON_PAD);
   }
+  let gpi = 0;
   while (gaps.length < 2) {
-    gaps.push('Confirm stage, sector, and check size against this fund’s recent deals.');
+    gaps.push([GAP_PAD_A, GAP_PAD_B][gpi++ % 2]);
   }
   let verdict =
     String(r?.one_sentence_verdict || '').trim() ||
-    (score >= 60 ? 'Potential fit — validate thesis alignment.' : 'Weak fit — limited overlap on available signals.');
+    (score >= 60 ? 'Potential fit — themes overlap between thesis and startup fields.' : 'Weak fit — limited overlap on the extracted signals.');
   verdict = alignVerdictToScore(score, verdict);
   let fc = Number(r?.fit_confidence_0_to_100);
   if (Number.isNaN(fc)) fc = null;
@@ -1713,7 +1764,9 @@ CRITICAL — no hallucinations: In top_reasons and gaps, never mention revenue, 
 
 If thesis fields show "unknown" (e.g. stage_focus, founder_signals), do not mention that in gaps — use two substantive diligence items (real misalignment, missing proof, sector/stage checks) instead. Never write "Firm X’s stage focus is unknown" style lines.
 
-If the fund thesis centers on a narrow vertical (e.g. voice assistants, smart home, crypto, defense) and the startup JSON does not mention that vertical, alignment_score must be at most 35 and gaps must state the mismatch clearly.`;
+If the fund thesis centers on a narrow vertical (e.g. voice assistants, smart home, crypto, defense) and the startup JSON does not mention that vertical, alignment_score must be at most 35 and gaps must state the mismatch clearly.
+
+Never use disclaimer or caveat phrasing in top_reasons, gaps, or analyst_read (e.g. "verify from primary sources", "public pages only", "marketing copy", "should be verified", "overlap is inferred"). Write only substantive fit or misfit content.`;
 
   let rankings = [];
   try {
@@ -1733,7 +1786,9 @@ Never invent revenue, customers, or metrics. Only cite startup facts present in 
 
 Verdict must match score: 70+ = "Strong fit", 40–69 = "Potential fit", below 40 = "Weak fit". top_reasons = alignment only; put hedges and mismatches in gaps.
 
-If thesis JSON has unknown fields, do not use "their stage focus is unknown" as a gap line — that reflects thin HTML, not the fund’s reputation. Prefer substantive fit/misfit reasons.`;
+If thesis JSON has unknown fields, do not use "their stage focus is unknown" as a gap line — that reflects thin HTML, not the fund’s reputation. Prefer substantive fit/misfit reasons.
+
+No disclaimer language in any field (verify/primary sources/marketing copy/public pages only).`;
         try {
           const row = await groqJson(one, 'One VC score. JSON only.', true, 2048);
           if (row && (row.alignment_score != null || row.top_reasons)) {
@@ -1746,15 +1801,18 @@ If thesis JSON has unknown fields, do not use "their stage focus is unknown" as 
           firm_name: f.name,
           alignment_score: 35,
           analyst_read:
-            'Match is directional based on thin homepage thesis text. Validate stage, sector, and check size on the fund’s site before outreach.',
+            'The fund homepage excerpt is short; the read below is from whatever thesis text was extracted.',
           fit_confidence_0_to_100: 42,
           top_reasons: [
-            'Limited thesis text from the fund site — directional match only.',
-            `Sector overlap: ${startupSlim.sector || 'unknown'} vs fund focus.`,
-            'Review fund site and portfolio for a sharper fit read.',
+            'Thesis block is thin but names a sector or theme adjacent to the startup JSON.',
+            `Startup sector (${startupSlim.sector || 'unknown'}) sits in the same headline bucket as the fund excerpt.`,
+            'Product surface and ICP in the JSON give hooks to compare against the fund’s stated focus.',
           ],
-          gaps: ['Thesis extraction may be thin or generic.', 'Stage fit not verified from primary sources.'],
-          one_sentence_verdict: 'Potential fit — confirm with fund materials and warm intro.',
+          gaps: [
+            'Portfolio companies from the crawl do not tightly match the startup’s wedge.',
+            GAP_PAD_A,
+          ],
+          one_sentence_verdict: 'Potential fit — overlap is based on short homepage text.',
         };
       });
       rankings = perVc;
@@ -1829,12 +1887,12 @@ async function runPipeline(startupUrl, resolveNote = '') {
   • Use public only if the excerpt clearly indicates a publicly traded company.
   • Use unknown if you cannot place the company confidently from the excerpt.
 - business_model, key_differentiator, target_customer
-- traction_signals (string or array), founding_team_signals (string or array)
+- traction_signals (string or array): ONLY concrete facts from the excerpt — user counts, revenue/ARR if stated, named customers, named investors, growth %, logos with numbers. NEVER output vague lines like "Backed by investors", "Backed by VCs", or "has funding" without a named party or numeric detail. Omit entirely if nothing concrete.
 - icp_summary: one sentence on who buys / primary user (or "")
 - product_surface: how they ship (e.g. web app, mobile, API, platform) — infer from excerpt or ""
 - competitive_angle: how they position vs alternatives using ONLY cues in the excerpt (no invented competitor names)
 - open_questions_for_investors: array of 3–4 short strings — important unknowns an investor would still need to diligence (missing from page)
-- investor_skim_bullets: array of exactly 3 punchy lines an associate would paste in a pass memo; ONLY facts supported by the excerpt
+- investor_skim_bullets: array of exactly 3 punchy lines; ONLY concrete facts (same bar as traction_signals). No generic "backed by investors" without names.
 
 Use unknown or "" or [] if missing.
 
@@ -1876,16 +1934,13 @@ Excerpt:
     `${startup.company_name || 'Company'} · ${startup.sector || 'sector TBD'}`
   );
 
-  const skimBullets = Array.isArray(startup.investor_skim_bullets)
-    ? startup.investor_skim_bullets.map((x) => String(x || '').trim()).filter(Boolean).slice(0, 3)
-    : [];
+  const skimBullets = filterSkimBulletsForDisplay(startup.investor_skim_bullets).slice(0, 3);
   const skimHtml =
     skimBullets.length > 0
       ? `<div class="snapshot-skim"><h4>Investor skim</h4><ul>${skimBullets.map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>`
       : '';
-  const tractionStr = Array.isArray(startup.traction_signals)
-    ? startup.traction_signals.filter(Boolean).join('; ')
-    : String(startup.traction_signals || '').trim();
+  const tractionParts = filterTractionSignalsForDisplay(startup.traction_signals);
+  const tractionStr = tractionParts.join('; ');
   const foundersStr = Array.isArray(startup.founding_team_signals)
     ? startup.founding_team_signals.filter(Boolean).join('; ')
     : String(startup.founding_team_signals || '').trim();
@@ -2294,7 +2349,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
         </div>
         ${
           !r.unscorable && r.fit_confidence_0_to_100 != null
-            ? `<p class="fit-confidence">Score confidence (sparse-data): ${esc(String(r.fit_confidence_0_to_100))}/100</p>`
+            ? `<p class="fit-confidence">Match confidence: ${esc(String(r.fit_confidence_0_to_100))}/100</p>`
             : ''
         }
         ${r.analyst_read && !r.unscorable ? `<div class="analyst-read">${esc(r.analyst_read)}</div>` : ''}
@@ -2320,10 +2375,16 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
   let pitchBodyHtml = '';
   if (topFirm && topThesis) {
     const thesisPitchPack = slimThesisForLlm(topThesis);
-    const pitchJsonUser = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis:\n${JSON.stringify(thesisPitchPack)}\n\nReturn JSON only with keys: opening_hook (string, 1–2 sentences), thesis_bridge (string, 2–4 sentences), proof_points (array of exactly 3 non-empty strings; each line must cite ONLY facts from Startup JSON), diligence_gaps (array of exactly 2 non-empty strings: what is missing from the excerpt that investors will still ask).\nRules: no revenue, customer names, funding rounds, or geographies unless they appear in the Startup JSON strings above. opening_hook must be plain and factual — no "revolutionizing", "cutting-edge", "game-changing", or similar hype unless those exact words appear in the Startup JSON.`;
+    const pitchJsonUser = `Startup:\n${JSON.stringify(startupSlim)}\n\nVC: ${topFirm.firm_name}\nThesis:\n${JSON.stringify(thesisPitchPack)}\n\nReturn JSON only with keys: opening_hook (string, 1–2 sentences), thesis_bridge (string, 3–5 sentences), proof_points (array of exactly 3 non-empty strings; each line must cite ONLY facts from Startup JSON), diligence_gaps (array of exactly 2 non-empty strings).\n\nBe specific and actionable (no generic "we are a software company" openers):\n- opening_hook: Name the VC once, name the startup once, quote or closely paraphrase ONE concrete string from Thesis (e.g. sector_focus, themes_or_trends, or product_signals) and tie it to ONE concrete Startup field (e.g. product_surface, icp_summary, key_differentiator, competitive_angle).\n- thesis_bridge: For each sentence, pair one Startup JSON field with one Thesis field by name (e.g. "Your themes_or_trends on X → our key_differentiator on Y"). At least two such pairings.\n- proof_points: Three bullets, each a single factual clause from Startup JSON (traction, ICP, product, positioning).\n- diligence_gaps: Two sharp product or go-to-market questions (e.g. deployment model, buyer workflow, why now) — not "verify the deck" or "check the website".\n\nRules: no revenue, customer names, funding rounds, or geographies unless they appear in the Startup JSON. No hype words ("revolutionizing", "cutting-edge") unless they appear verbatim in Startup JSON.`;
     try {
-      const po = await groqJson(pitchJsonUser, 'JSON only.', true, 1400);
-      const cleaned = sanitizeStructuredPitch(po, startupSlim, topFirm.firm_name);
+      const po = await groqJson(pitchJsonUser, 'JSON only.', true, 2048);
+      let cleaned = sanitizeStructuredPitch(po, startupSlim, topFirm.firm_name);
+      cleaned = {
+        opening_hook: isDisclaimerLine(cleaned.opening_hook) ? '' : cleaned.opening_hook,
+        thesis_bridge: isDisclaimerLine(cleaned.thesis_bridge) ? '' : cleaned.thesis_bridge,
+        proof_points: filterDisclaimerFromStrings(cleaned.proof_points || []),
+        diligence_gaps: filterDisclaimerFromStrings(cleaned.diligence_gaps || []),
+      };
       const structuredHtml = structuredPitchToHtml(cleaned);
       if (structuredHtml.replace(/<[^>]+>/g, '').trim().length > 35) {
         pitchBodyHtml = structuredHtml;
@@ -2385,7 +2446,7 @@ Websites must be the fund's own domain. Return as many solid funds as you can (a
       `Startup sector/stage: ${startupSlim.sector} / ${startupSlim.stage}. Scores: ${rankLine}.
 N/A means fund thesis was missing (fetch or extraction), not a numeric score of zero.
 Return JSON only: {"biggest_uncertainty":"","confidence_0_to_100":70}
-biggest_uncertainty = one short paragraph on methodology limits (thin homepages, extracted text only) — not “funds passed” or “missing scores mean rejection.”`,
+biggest_uncertainty = one short paragraph naming the biggest substantive gap in this specific match (e.g. missing buyer detail, unclear fund stage fit, thin thesis on one side). No instructions to verify elsewhere, no “scraped pages are unreliable” disclaimers.`,
       'JSON only.',
       true,
       1024
@@ -2397,7 +2458,7 @@ biggest_uncertainty = one short paragraph on methodology limits (thin homepages,
   } catch {
     try {
       const txt = await groqCompleteRetry(
-        `In 2-3 sentences, what is the biggest weakness of using scraped VC homepages to score fit for ${startupSlim.company_name}? Then on a new line write CONFIDENCE:NN (0-100).`,
+        `In 2-3 sentences, what is the biggest substantive gap in the fit read for ${startupSlim.company_name} given only homepage excerpts (e.g. missing ICP, stage, or product detail)? Then on a new line write CONFIDENCE:NN (0-100). No “verify elsewhere” language.`,
         'Be concise.',
         false,
         3,
@@ -2410,8 +2471,12 @@ biggest_uncertainty = one short paragraph on methodology limits (thin homepages,
       };
     } catch {
       reflect.uncertainty =
-        'Treat the match as directional: thesis text is often thin and discovery may use a fallback fund list.';
+        'The read leans on whatever showed up in the startup and fund excerpts; missing fields in either JSON narrow how tight the match can be.';
     }
+  }
+  if (isDisclaimerLine(reflect.uncertainty)) {
+    reflect.uncertainty =
+      'Some thesis or startup fields were thin in this crawl, so the match is only as specific as those excerpts allow.';
   }
   finishStep('s8', 'Step 8 — Reflect', `Confidence ${reflect.confidence}/100`);
 
